@@ -12,6 +12,13 @@ SRC_DIR          := $(GW_SNITCH_SW_DIR)/apps/$(APP)/src
 # All sources are compiled + linked into one ELF by the common.mk recipe
 # (which passes $(SRCS) to a single $(SN_RISCV_CXX) -x c++ invocation). No
 # datagen step: the input is supplied at runtime by the host via L2 SPM.
+# NOTE: qcs_world_comm.c is intentionally NOT linked. It used to strong-override
+# snrt_comm_world_info with a size=1 world communicator to dodge the boot-time
+# global barrier. That was masking the real bug: the host woke only cluster 0,
+# so the other 15 never reached the world=SNRT_CLUSTER_NUM(=16) barrier. The fix
+# is the simple_offload boot model (host entries+wakes all clusters), so the
+# default weak snrt_comm_world_info (size=SNRT_CLUSTER_NUM) is now correct and
+# the override is removed (see qcs_world_comm.c header for the full history).
 SRCS := $(SRC_DIR)/main.c \
         $(SRC_DIR)/qcs_replay.c \
         $(SRC_DIR)/cluster_command_stream.c \

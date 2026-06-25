@@ -33,6 +33,11 @@ extern "C" {
 // Every record is aligned to this many bytes within the stream.
 #define QCS_RECORD_ALIGN 8u
 
+// Offset of the job descriptor within the shared region (e.g. L2 SPM). Must be
+// above the cluster firmware's image, which links at the region base — placing
+// the descriptor at offset 0 collides with the firmware .text.
+#define QCS_JOB_DESCRIPTOR_OFFSET 0x10000u
+
 typedef enum qcs_cmd_type_e {
   QCS_CMD_DISPATCH = 1,  // replay a dispatch onto the compute cores
   QCS_CMD_COPY = 2,      // device-side iDMA copy (PA -> PA)

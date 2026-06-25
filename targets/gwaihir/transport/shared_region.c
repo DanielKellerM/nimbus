@@ -23,6 +23,7 @@ static int qcs_map_fd(qcs_shared_region_t* region, int fd, uint64_t size) {
   region->base = base;
   region->size = size;
   region->fd = fd;
+  region->desc_offset = 0;  // dev-box: no firmware below; descriptor at PA 0.
   return 0;
 }
 
@@ -31,6 +32,7 @@ int qcs_shared_region_create(qcs_shared_region_t* region, const char* path,
   region->base = NULL;
   region->size = 0;
   region->fd = -1;
+  region->desc_offset = 0;
   if (size < QCS_SHARED_ARENA_OFFSET) return -1;
   int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
   if (fd < 0) return -1;
@@ -64,6 +66,7 @@ void qcs_shared_region_close(qcs_shared_region_t* region) {
   region->base = NULL;
   region->size = 0;
   region->fd = -1;
+  region->desc_offset = 0;
 }
 
 uint64_t qcs_shared_alloc(qcs_shared_region_t* region, uint64_t* bump,
