@@ -153,13 +153,156 @@ static const iree_hal_semaphore_vtable_t iree_hal_cluster_semaphore_vtable = {
 };
 
 //===----------------------------------------------------------------------===//
+// Trivial executable + executable cache
+//===----------------------------------------------------------------------===//
+// The host records dispatches into the QCS stream; it does not run kernels.
+// The HAL module still requires a HAL executable object (created via the
+// executable cache during context init) so the command buffer has a stable
+// iree_hal_executable_t* to assign a QCS executable_id to, and so dispatch's
+// export-ordinal resolution succeeds. The real kernel runs on the Snitch
+// cluster (Phase-2), keyed by executable_table_id + ordinal.
+
+typedef struct iree_hal_cluster_executable_t {
+  iree_hal_resource_t resource;
+  iree_allocator_t host_allocator;
+} iree_hal_cluster_executable_t;
+
+static const iree_hal_executable_vtable_t iree_hal_cluster_executable_vtable;
+
+static void iree_hal_cluster_executable_destroy(
+    iree_hal_executable_t* base_executable) {
+  iree_hal_cluster_executable_t* executable =
+      (iree_hal_cluster_executable_t*)base_executable;
+  iree_allocator_t host_allocator = executable->host_allocator;
+  iree_allocator_free(host_allocator, executable);
+}
+
+static iree_host_size_t iree_hal_cluster_executable_export_count(
+    iree_hal_executable_t* base_executable) {
+  (void)base_executable;
+  return 1;
+}
+
+static iree_status_t iree_hal_cluster_executable_export_info(
+    iree_hal_executable_t* base_executable,
+    iree_hal_executable_export_ordinal_t export_ordinal,
+    iree_hal_executable_export_info_t* out_info) {
+  (void)base_executable;
+  (void)export_ordinal;
+  memset(out_info, 0, sizeof(*out_info));
+  out_info->name = IREE_SV("cluster_export");
+  out_info->workgroup_size[0] = 1;
+  out_info->workgroup_size[1] = 1;
+  out_info->workgroup_size[2] = 1;
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_cluster_executable_export_parameters(
+    iree_hal_executable_t* base_executable,
+    iree_hal_executable_export_ordinal_t export_ordinal,
+    iree_host_size_t capacity,
+    iree_hal_executable_export_parameter_t* out_parameters) {
+  (void)base_executable;
+  (void)export_ordinal;
+  (void)capacity;
+  (void)out_parameters;
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_cluster_executable_lookup_export_by_name(
+    iree_hal_executable_t* base_executable, iree_string_view_t name,
+    iree_hal_executable_export_ordinal_t* out_export_ordinal) {
+  (void)base_executable;
+  (void)name;
+  *out_export_ordinal = 0;
+  return iree_ok_status();
+}
+
+static const iree_hal_executable_vtable_t iree_hal_cluster_executable_vtable = {
+    .destroy = iree_hal_cluster_executable_destroy,
+    .export_count = iree_hal_cluster_executable_export_count,
+    .export_info = iree_hal_cluster_executable_export_info,
+    .export_parameters = iree_hal_cluster_executable_export_parameters,
+    .lookup_export_by_name = iree_hal_cluster_executable_lookup_export_by_name,
+};
+
+typedef struct iree_hal_cluster_executable_cache_t {
+  iree_hal_resource_t resource;
+  iree_allocator_t host_allocator;
+} iree_hal_cluster_executable_cache_t;
+
+static const iree_hal_executable_cache_vtable_t
+    iree_hal_cluster_executable_cache_vtable;
+
+static void iree_hal_cluster_executable_cache_destroy(
+    iree_hal_executable_cache_t* base_cache) {
+  iree_hal_cluster_executable_cache_t* cache =
+      (iree_hal_cluster_executable_cache_t*)base_cache;
+  iree_allocator_t host_allocator = cache->host_allocator;
+  iree_allocator_free(host_allocator, cache);
+}
+
+static bool iree_hal_cluster_executable_cache_can_prepare_format(
+    iree_hal_executable_cache_t* base_cache,
+    iree_hal_executable_caching_mode_t caching_mode,
+    iree_string_view_t executable_format) {
+  (void)base_cache;
+  (void)caching_mode;
+  (void)executable_format;
+  return true;
+}
+
+static iree_status_t iree_hal_cluster_executable_cache_infer_format(
+    iree_hal_executable_cache_t* base_cache,
+    iree_hal_executable_caching_mode_t caching_mode,
+    iree_const_byte_span_t executable_data,
+    iree_host_size_t executable_format_capacity, char* executable_format,
+    iree_host_size_t* out_inferred_size) {
+  (void)base_cache;
+  (void)caching_mode;
+  if (out_inferred_size) *out_inferred_size = executable_data.data_length;
+  if (executable_format_capacity > 0) executable_format[0] = '\0';
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_cluster_executable_cache_prepare_executable(
+    iree_hal_executable_cache_t* base_cache,
+    const iree_hal_executable_params_t* executable_params,
+    iree_hal_executable_t** out_executable) {
+  iree_hal_cluster_executable_cache_t* cache =
+      (iree_hal_cluster_executable_cache_t*)base_cache;
+  (void)executable_params;
+  *out_executable = NULL;
+  iree_hal_cluster_executable_t* executable = NULL;
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+      cache->host_allocator, sizeof(*executable), (void**)&executable));
+  iree_hal_resource_initialize(&iree_hal_cluster_executable_vtable,
+                               &executable->resource);
+  executable->host_allocator = cache->host_allocator;
+  *out_executable = (iree_hal_executable_t*)executable;
+  return iree_ok_status();
+}
+
+static const iree_hal_executable_cache_vtable_t
+    iree_hal_cluster_executable_cache_vtable = {
+        .destroy = iree_hal_cluster_executable_cache_destroy,
+        .infer_format = iree_hal_cluster_executable_cache_infer_format,
+        .can_prepare_format =
+            iree_hal_cluster_executable_cache_can_prepare_format,
+        .prepare_executable =
+            iree_hal_cluster_executable_cache_prepare_executable,
+};
+
+//===----------------------------------------------------------------------===//
 // iree_hal_cluster_device_t
 //===----------------------------------------------------------------------===//
 
 // Each command buffer's QCS stream is allocated from the shared arena; the
 // command buffer exposes its own stream device-PA (..._stream_pa), so the
-// device needs no command-buffer -> PA table.
-#define IREE_HAL_CLUSTER_STREAM_CAPACITY (64u * 1024u)
+// device needs no command-buffer -> PA table. Sized to hold at least one
+// max-size update_buffer payload (64KB, IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE)
+// plus record headers.
+#define IREE_HAL_CLUSTER_STREAM_CAPACITY (128u * 1024u)
 
 typedef struct iree_hal_cluster_device_t {
   iree_hal_resource_t resource;
@@ -281,6 +424,13 @@ static iree_status_t iree_hal_cluster_device_query_i64(
     *out_value = 1;  // synchronous single-queue device.
     return iree_ok_status();
   }
+  // The host only RECORDS dispatches; the cluster runs the real snitch kernel,
+  // so advertise support for any executable format (else device selection fails
+  // with "device not found or unavailable").
+  if (iree_string_view_equal(category, IREE_SV("hal.executable.format"))) {
+    *out_value = 1;  // format supported
+    return iree_ok_status();
+  }
   return iree_make_status(
       IREE_STATUS_NOT_FOUND,
       "unknown device configuration key value '%.*s :: %.*s'",
@@ -382,9 +532,9 @@ static iree_status_t iree_hal_cluster_device_create_command_buffer(
   return iree_ok_status();
 }
 
-iree_status_t iree_hal_cluster_device_submit(
-    iree_hal_device_t* base_device,
-    iree_hal_command_buffer_t* command_buffer) {
+static iree_status_t iree_hal_cluster_device_submit_table(
+    iree_hal_device_t* base_device, iree_hal_command_buffer_t* command_buffer,
+    iree_hal_buffer_binding_table_t binding_table) {
   iree_hal_cluster_device_t* device = iree_hal_cluster_device_cast(base_device);
 
   if (!command_buffer ||
@@ -392,6 +542,11 @@ iree_status_t iree_hal_cluster_device_submit(
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "expected a cluster command buffer");
   }
+
+  // Resolve the deferred command list against the submission binding table and
+  // serialize it into the QCS stream now (record-time refs may be indirect).
+  IREE_RETURN_IF_ERROR(
+      iree_hal_cluster_command_buffer_emit(command_buffer, binding_table));
 
   uint64_t stream_pa =
       iree_hal_cluster_command_buffer_stream_pa(command_buffer);
@@ -427,6 +582,14 @@ iree_status_t iree_hal_cluster_device_submit(
   return iree_ok_status();
 }
 
+// Public submit (no binding table) -- for tests/callers recording direct refs.
+iree_status_t iree_hal_cluster_device_submit(
+    iree_hal_device_t* base_device,
+    iree_hal_command_buffer_t* command_buffer) {
+  return iree_hal_cluster_device_submit_table(
+      base_device, command_buffer, iree_hal_buffer_binding_table_empty());
+}
+
 static iree_status_t iree_hal_cluster_device_create_event(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
     iree_hal_event_flags_t flags, iree_hal_event_t** out_event) {
@@ -437,9 +600,18 @@ static iree_status_t iree_hal_cluster_device_create_event(
 static iree_status_t iree_hal_cluster_device_create_executable_cache(
     iree_hal_device_t* base_device, iree_string_view_t identifier,
     iree_loop_t loop, iree_hal_executable_cache_t** out_executable_cache) {
-  return iree_make_status(
-      IREE_STATUS_UNIMPLEMENTED,
-      "executable cache not implemented on the cluster device (Phase-1)");
+  iree_hal_cluster_device_t* device = iree_hal_cluster_device_cast(base_device);
+  (void)identifier;
+  (void)loop;
+  *out_executable_cache = NULL;
+  iree_hal_cluster_executable_cache_t* cache = NULL;
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+      device->host_allocator, sizeof(*cache), (void**)&cache));
+  iree_hal_resource_initialize(&iree_hal_cluster_executable_cache_vtable,
+                               &cache->resource);
+  cache->host_allocator = device->host_allocator;
+  *out_executable_cache = (iree_hal_executable_cache_t*)cache;
+  return iree_ok_status();
 }
 
 static iree_status_t iree_hal_cluster_device_import_file(
@@ -586,8 +758,8 @@ static iree_status_t iree_hal_cluster_device_queue_execute(
 
   // A barrier-only submission (no command buffer) is a valid no-op.
   if (command_buffer) {
-    iree_status_t submit_status =
-        iree_hal_cluster_device_submit(base_device, command_buffer);
+    iree_status_t submit_status = iree_hal_cluster_device_submit_table(
+        base_device, command_buffer, binding_table);
     if (!iree_status_is_ok(submit_status)) {
       iree_hal_semaphore_list_fail(signal_semaphore_list,
                                    iree_status_clone(submit_status));

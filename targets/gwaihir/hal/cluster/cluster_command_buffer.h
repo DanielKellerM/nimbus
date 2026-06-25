@@ -50,6 +50,13 @@ iree_status_t iree_hal_cluster_command_buffer_create(
 bool iree_hal_cluster_command_buffer_isa(
     iree_hal_command_buffer_t* command_buffer);
 
+// Resolves the deferred command list against |binding_table| (supplied at
+// submission) and serializes it into the QCS stream buffer. Must be called
+// before reading back the stream PA/size/record-count.
+iree_status_t iree_hal_cluster_command_buffer_emit(
+    iree_hal_command_buffer_t* command_buffer,
+    iree_hal_buffer_binding_table_t binding_table);
+
 // Reads back the number of bytes written into the QCS stream so far (the
 // qcs_writer_t::size after `end`).
 uint32_t iree_hal_cluster_command_buffer_size(

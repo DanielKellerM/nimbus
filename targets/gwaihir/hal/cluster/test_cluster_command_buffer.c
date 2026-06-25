@@ -213,6 +213,11 @@ int main(void) {
 
   CHECK_OK(iree_hal_command_buffer_end(cb));
 
+  // Reusable command buffers defer serialization to submission: resolve the
+  // (here all-direct) refs against an empty binding table and emit the stream.
+  CHECK_OK(iree_hal_cluster_command_buffer_emit(
+      cb, iree_hal_buffer_binding_table_empty()));
+
   uint32_t stream_size = iree_hal_cluster_command_buffer_size(cb);
   uint32_t record_count = iree_hal_cluster_command_buffer_record_count(cb);
   fprintf(stderr, "stream_size=%u record_count=%u\n", stream_size,
