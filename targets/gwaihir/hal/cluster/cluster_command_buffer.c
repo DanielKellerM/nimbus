@@ -29,13 +29,15 @@
 
 #define IREE_HAL_CLUSTER_MAX_DISPATCH_BINDINGS 32
 #define IREE_HAL_CLUSTER_MAX_EXECUTABLES 64
-#define IREE_HAL_CLUSTER_MAX_RECORDS 256
+// A single model's command buffer holds only a handful of records; 64 is ample.
+// (Larger values bloat the statically-sized record array.)
+#define IREE_HAL_CLUSTER_MAX_RECORDS 64
 #define IREE_HAL_CLUSTER_MAX_CONSTANTS 64
-// Match IREE's update_buffer contract (IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE).
-#define IREE_HAL_CLUSTER_INLINE_UPDATE_BYTES (64u * 1024u)
-static_assert(IREE_HAL_CLUSTER_INLINE_UPDATE_BYTES >=
-                  IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE,
-              "inline update cap must cover IREE's max update size");
+// Cap on a single update_buffer payload. We do NOT statically reserve this per
+// record — the bytes are heap-allocated on demand sized to the actual update —
+// but we keep IREE's contract (IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE) as the
+// rejection threshold.
+#define IREE_HAL_CLUSTER_MAX_UPDATE_BYTES IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE
 
 typedef enum {
   CLUSTER_REC_DISPATCH = 1,
@@ -64,8 +66,11 @@ typedef struct cluster_deferred_record_t {
   uint64_t length;
   uint64_t fill_pattern;
   uint32_t fill_pattern_length;
+  // UPDATE: inline host blob, heap-allocated on demand from host_allocator
+  // sized to the actual update_length (NOT statically reserved). Owned by the
+  // record; freed in release-record / destroy.
   uint32_t update_length;
-  uint8_t update_data[IREE_HAL_CLUSTER_INLINE_UPDATE_BYTES];
+  uint8_t* update_data;
 } cluster_deferred_record_t;
 
 typedef struct iree_hal_cluster_command_buffer_t {
@@ -140,9 +145,11 @@ static void iree_hal_cluster_retain_direct_ref(iree_hal_buffer_ref_t ref) {
   if (ref.buffer) iree_hal_buffer_retain(ref.buffer);
 }
 
-// Releases every direct-ref buffer retained while recording |r|.
+// Releases every direct-ref buffer retained while recording |r|, and frees any
+// heap-allocated UPDATE payload owned by the record.
 static void iree_hal_cluster_release_record_refs(
-    const cluster_deferred_record_t* r) {
+    iree_hal_cluster_command_buffer_t* command_buffer,
+    cluster_deferred_record_t* r) {
   switch (r->kind) {
     case CLUSTER_REC_DISPATCH:
       for (uint32_t b = 0; b < r->binding_count; ++b) {
@@ -158,17 +165,25 @@ static void iree_hal_cluster_release_record_refs(
       if (r->dst_ref.buffer) iree_hal_buffer_release(r->dst_ref.buffer);
       break;
     case CLUSTER_REC_FILL:
+      if (r->dst_ref.buffer) iree_hal_buffer_release(r->dst_ref.buffer);
+      break;
     case CLUSTER_REC_UPDATE:
       if (r->dst_ref.buffer) iree_hal_buffer_release(r->dst_ref.buffer);
+      if (r->update_data) {
+        iree_allocator_free(command_buffer->host_allocator, r->update_data);
+        r->update_data = NULL;
+      }
       break;
   }
 }
 
-// Releases all retained direct-ref buffers and resets the record list.
+// Releases all retained direct-ref buffers / update payloads and resets the
+// record list.
 static void iree_hal_cluster_release_all_records(
     iree_hal_cluster_command_buffer_t* command_buffer) {
   for (uint32_t i = 0; i < command_buffer->record_count; ++i) {
-    iree_hal_cluster_release_record_refs(&command_buffer->records[i]);
+    iree_hal_cluster_release_record_refs(command_buffer,
+                                         &command_buffer->records[i]);
   }
   command_buffer->record_count = 0;
 }
@@ -512,7 +527,7 @@ static iree_status_t iree_hal_cluster_command_buffer_update_buffer(
     iree_hal_update_flags_t flags) {
   iree_hal_cluster_command_buffer_t* command_buffer =
       iree_hal_cluster_command_buffer_cast(base_command_buffer);
-  if ((uint64_t)target_ref.length > IREE_HAL_CLUSTER_INLINE_UPDATE_BYTES) {
+  if ((uint64_t)target_ref.length > IREE_HAL_CLUSTER_MAX_UPDATE_BYTES) {
     iree_hal_cluster_command_buffer_fail(
         command_buffer, iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
                                          "update payload too large"));
@@ -524,8 +539,17 @@ static iree_status_t iree_hal_cluster_command_buffer_update_buffer(
   r->dst_ref = target_ref;
   iree_hal_cluster_retain_direct_ref(target_ref);
   r->update_length = (uint32_t)target_ref.length;
-  memcpy(r->update_data, (const uint8_t*)source_buffer + source_offset,
-         r->update_length);
+  if (r->update_length) {
+    iree_status_t status = iree_allocator_malloc(
+        command_buffer->host_allocator, r->update_length,
+        (void**)&r->update_data);
+    if (!iree_status_is_ok(status)) {
+      iree_hal_cluster_command_buffer_fail(command_buffer, status);
+      return iree_ok_status();
+    }
+    memcpy(r->update_data, (const uint8_t*)source_buffer + source_offset,
+           r->update_length);
+  }
   return iree_ok_status();
 }
 

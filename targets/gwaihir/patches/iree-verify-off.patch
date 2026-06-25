@@ -1,0 +1,20 @@
+diff --git a/runtime/src/iree/vm/bytecode/verifier.c b/runtime/src/iree/vm/bytecode/verifier.c
+index b7569599fc..f1c955fe72 100644
+--- a/runtime/src/iree/vm/bytecode/verifier.c
++++ b/runtime/src/iree/vm/bytecode/verifier.c
+@@ -21,6 +21,7 @@ iree_status_t iree_vm_bytecode_module_flatbuffer_verify(
+   // Run flatcc generated verification. This ensures all pointers are in-bounds
+   // and that we can safely walk the file, but not that the actual contents of
+   // the FlatBuffer meet our expectations.
++#if IREE_VM_BYTECODE_VERIFICATION_ENABLE
+   int verify_ret = iree_vm_BytecodeModuleDef_verify_as_root(
+       flatbuffer_contents.data, flatbuffer_contents.data_length);
+   if (verify_ret != flatcc_verify_ok) {
+@@ -28,6 +29,7 @@ iree_status_t iree_vm_bytecode_module_flatbuffer_verify(
+                             "FlatBuffer verification failed: %s",
+                             flatcc_verify_error_string(verify_ret));
+   }
++#endif  // IREE_VM_BYTECODE_VERIFICATION_ENABLE
+ 
+   iree_vm_BytecodeModuleDef_table_t module_def =
+       iree_vm_BytecodeModuleDef_as_root(flatbuffer_contents.data);
