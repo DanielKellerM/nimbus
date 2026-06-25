@@ -2,8 +2,23 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
+// QCS-emitting IREE HAL command buffer (host side of the host<->cluster split).
+//
+// IREE's reusable command buffers record bindings as *indirect* references into
+// a binding table that is only supplied at submission (queue_execute). A
+// recorder that serializes immediately therefore cannot resolve bindings to
+// device-PAs at record time. This implementation DEFERS: each command is
+// captured into an in-memory record list (carrying the raw iree_hal_buffer_ref_t
+// with its buffer_slot), and `iree_hal_cluster_command_buffer_emit` resolves
+// every ref against the submission binding table and writes the flat QCS stream.
+//
+// Device buffers come from the slice-2a allocator (heap-wrapped region_base+PA);
+// a resolved ref's device-PA is recovered by mapping it and computing
+// pa = qcs_ptr_to_pa(region, mapped_ptr).
+
 #include "runtime/host/hal/cluster/cluster_command_buffer.h"
 
+#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -12,34 +27,65 @@
 #include "iree/hal/api.h"
 #include "runtime/host/transport/cluster_command_stream.h"
 
-//===----------------------------------------------------------------------===//
-// iree_hal_cluster_command_buffer_t
-//===----------------------------------------------------------------------===//
-
-// Maximum distinct bindings we resolve for a single dispatch. The QCS
-// dispatch record carries an arbitrary count; this just bounds the on-stack
-// translation scratch.
 #define IREE_HAL_CLUSTER_MAX_DISPATCH_BINDINGS 32
-
-// Maximum distinct executables tracked in the host-owned executable table.
 #define IREE_HAL_CLUSTER_MAX_EXECUTABLES 64
+#define IREE_HAL_CLUSTER_MAX_RECORDS 256
+#define IREE_HAL_CLUSTER_MAX_CONSTANTS 64
+// Match IREE's update_buffer contract (IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE).
+#define IREE_HAL_CLUSTER_INLINE_UPDATE_BYTES (64u * 1024u)
+static_assert(IREE_HAL_CLUSTER_INLINE_UPDATE_BYTES >=
+                  IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE,
+              "inline update cap must cover IREE's max update size");
+
+typedef enum {
+  CLUSTER_REC_DISPATCH = 1,
+  CLUSTER_REC_COPY,
+  CLUSTER_REC_FILL,
+  CLUSTER_REC_UPDATE,
+} cluster_rec_kind_t;
+
+typedef struct cluster_deferred_record_t {
+  cluster_rec_kind_t kind;
+  // DISPATCH
+  uint32_t executable_id;
+  uint32_t export_ordinal;
+  uint32_t flags;           // 0 or QCS_DISPATCH_FLAG_INDIRECT
+  uint32_t workgroup_count[3];
+  uint32_t workgroup_size[3];
+  uint32_t dynamic_local_memory;
+  uint32_t constant_count;
+  uint32_t constants[IREE_HAL_CLUSTER_MAX_CONSTANTS];
+  uint32_t binding_count;
+  iree_hal_buffer_ref_t bindings[IREE_HAL_CLUSTER_MAX_DISPATCH_BINDINGS];
+  iree_hal_buffer_ref_t workgroup_count_ref;  // indirect dispatch
+  // COPY/FILL/UPDATE
+  iree_hal_buffer_ref_t src_ref;     // COPY source
+  iree_hal_buffer_ref_t dst_ref;     // COPY/FILL/UPDATE target
+  uint64_t length;
+  uint64_t fill_pattern;
+  uint32_t fill_pattern_length;
+  uint32_t update_length;
+  uint8_t update_data[IREE_HAL_CLUSTER_INLINE_UPDATE_BYTES];
+} cluster_deferred_record_t;
 
 typedef struct iree_hal_cluster_command_buffer_t {
   iree_hal_command_buffer_t base;
   iree_allocator_t host_allocator;
 
-  // Shared region used to translate host-VA mappings -> device-PA.
   qcs_shared_region_t* region;
 
-  // Writer over the caller-provided QCS stream buffer.
-  qcs_writer_t writer;
+  // QCS stream buffer (filled at emit time).
+  void* stream_ptr;
+  uint32_t stream_capacity;
+  qcs_writer_t writer;  // valid after emit
 
-  // Host-owned executable table: distinct iree_hal_executable_t* -> id.
   iree_hal_executable_t* executables[IREE_HAL_CLUSTER_MAX_EXECUTABLES];
   uint32_t executable_count;
 
-  // First error encountered while recording (e.g. mapping failure or stream
-  // overflow). Reported back at `end`.
+  // Deferred command list.
+  cluster_deferred_record_t records[IREE_HAL_CLUSTER_MAX_RECORDS];
+  uint32_t record_count;
+
   iree_status_t record_status;
 } iree_hal_cluster_command_buffer_t;
 
@@ -62,28 +108,71 @@ bool iree_hal_cluster_command_buffer_isa(
 // Helpers
 //===----------------------------------------------------------------------===//
 
-// Resolves a buffer reference to its device-physical address by mapping the
-// buffer at |ref.offset| and computing (mapped_ptr - region_base). Unmaps
-// before returning; the PA stays valid because the heap wrap is stable for the
-// buffer's lifetime.
-static iree_status_t iree_hal_cluster_command_buffer_ref_to_pa(
-    iree_hal_cluster_command_buffer_t* command_buffer,
-    iree_hal_buffer_ref_t ref, uint64_t* out_pa) {
-  *out_pa = 0;
-  if (!ref.buffer) {
-    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
-                            "binding buffer is NULL");
+static void iree_hal_cluster_command_buffer_fail(
+    iree_hal_cluster_command_buffer_t* command_buffer, iree_status_t status) {
+  if (iree_status_is_ok(command_buffer->record_status)) {
+    command_buffer->record_status = status;
+  } else {
+    iree_status_ignore(status);
   }
-  iree_hal_buffer_mapping_t mapping = {{0}};
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
-      ref.buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_ANY,
-      ref.offset, ref.length ? ref.length : 1, &mapping));
-  *out_pa = qcs_ptr_to_pa(command_buffer->region, mapping.contents.data);
-  iree_hal_buffer_unmap_range(&mapping);
-  return iree_ok_status();
 }
 
-// Returns the host-owned id for |executable|, allocating a new one if unseen.
+static cluster_deferred_record_t* iree_hal_cluster_alloc_record(
+    iree_hal_cluster_command_buffer_t* command_buffer,
+    cluster_rec_kind_t kind) {
+  if (command_buffer->record_count >= IREE_HAL_CLUSTER_MAX_RECORDS) {
+    iree_hal_cluster_command_buffer_fail(
+        command_buffer, iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                         "cluster command buffer record limit"));
+    return NULL;
+  }
+  cluster_deferred_record_t* r =
+      &command_buffer->records[command_buffer->record_count++];
+  memset(r, 0, sizeof(*r));
+  r->kind = kind;
+  return r;
+}
+
+// Retains a direct ref's buffer so it survives between record and emit (emit
+// maps it). Indirect refs (buffer==NULL) are resolved from the binding table at
+// submit and owned by the caller, so are not retained here.
+static void iree_hal_cluster_retain_direct_ref(iree_hal_buffer_ref_t ref) {
+  if (ref.buffer) iree_hal_buffer_retain(ref.buffer);
+}
+
+// Releases every direct-ref buffer retained while recording |r|.
+static void iree_hal_cluster_release_record_refs(
+    const cluster_deferred_record_t* r) {
+  switch (r->kind) {
+    case CLUSTER_REC_DISPATCH:
+      for (uint32_t b = 0; b < r->binding_count; ++b) {
+        if (r->bindings[b].buffer) iree_hal_buffer_release(r->bindings[b].buffer);
+      }
+      if ((r->flags & QCS_DISPATCH_FLAG_INDIRECT) &&
+          r->workgroup_count_ref.buffer) {
+        iree_hal_buffer_release(r->workgroup_count_ref.buffer);
+      }
+      break;
+    case CLUSTER_REC_COPY:
+      if (r->src_ref.buffer) iree_hal_buffer_release(r->src_ref.buffer);
+      if (r->dst_ref.buffer) iree_hal_buffer_release(r->dst_ref.buffer);
+      break;
+    case CLUSTER_REC_FILL:
+    case CLUSTER_REC_UPDATE:
+      if (r->dst_ref.buffer) iree_hal_buffer_release(r->dst_ref.buffer);
+      break;
+  }
+}
+
+// Releases all retained direct-ref buffers and resets the record list.
+static void iree_hal_cluster_release_all_records(
+    iree_hal_cluster_command_buffer_t* command_buffer) {
+  for (uint32_t i = 0; i < command_buffer->record_count; ++i) {
+    iree_hal_cluster_release_record_refs(&command_buffer->records[i]);
+  }
+  command_buffer->record_count = 0;
+}
+
 static iree_status_t iree_hal_cluster_command_buffer_executable_id(
     iree_hal_cluster_command_buffer_t* command_buffer,
     iree_hal_executable_t* executable, uint32_t* out_id) {
@@ -95,8 +184,7 @@ static iree_status_t iree_hal_cluster_command_buffer_executable_id(
   }
   if (command_buffer->executable_count >= IREE_HAL_CLUSTER_MAX_EXECUTABLES) {
     return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                            "executable table full (max %d)",
-                            IREE_HAL_CLUSTER_MAX_EXECUTABLES);
+                            "executable table full");
   }
   uint32_t id = command_buffer->executable_count++;
   command_buffer->executables[id] = executable;
@@ -104,14 +192,26 @@ static iree_status_t iree_hal_cluster_command_buffer_executable_id(
   return iree_ok_status();
 }
 
-// Records the first error; later errors are dropped.
-static void iree_hal_cluster_command_buffer_fail(
-    iree_hal_cluster_command_buffer_t* command_buffer, iree_status_t status) {
-  if (iree_status_is_ok(command_buffer->record_status)) {
-    command_buffer->record_status = status;
-  } else {
-    iree_status_ignore(status);
+// Resolve a (possibly indirect) ref against the binding table to a device-PA.
+static iree_status_t iree_hal_cluster_resolve_ref_to_pa(
+    iree_hal_cluster_command_buffer_t* command_buffer,
+    iree_hal_buffer_ref_t ref, iree_hal_buffer_binding_table_t binding_table,
+    uint64_t* out_pa) {
+  *out_pa = 0;
+  iree_hal_buffer_ref_t resolved;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_binding_table_resolve_ref(binding_table, ref, &resolved));
+  if (!resolved.buffer) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "binding resolved to NULL buffer");
   }
+  iree_hal_buffer_mapping_t mapping = {{0}};
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      resolved.buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_ANY,
+      resolved.offset, resolved.length ? resolved.length : 1, &mapping));
+  *out_pa = qcs_ptr_to_pa(command_buffer->region, mapping.contents.data);
+  iree_hal_buffer_unmap_range(&mapping);
+  return iree_ok_status();
 }
 
 //===----------------------------------------------------------------------===//
@@ -123,6 +223,7 @@ static void iree_hal_cluster_command_buffer_destroy(
   iree_hal_cluster_command_buffer_t* command_buffer =
       iree_hal_cluster_command_buffer_cast(base_command_buffer);
   iree_allocator_t host_allocator = command_buffer->host_allocator;
+  iree_hal_cluster_release_all_records(command_buffer);
   iree_status_ignore(command_buffer->record_status);
   iree_allocator_free(host_allocator, command_buffer);
 }
@@ -144,14 +245,6 @@ iree_status_t iree_hal_cluster_command_buffer_create(
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "QCS stream buffer must be 8-byte aligned");
   }
-  // Binding tables are resolved by IREE only at submission, so a recorder that
-  // serializes at record time cannot honor them yet. Reject rather than emit
-  // dispatches with unresolved (NULL-buffer) refs.
-  if (binding_capacity > 0) {
-    return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                            "cluster command buffer does not support indirect "
-                            "binding tables");
-  }
 
   iree_host_size_t total_size =
       sizeof(iree_hal_cluster_command_buffer_t) +
@@ -171,11 +264,107 @@ iree_status_t iree_hal_cluster_command_buffer_create(
       &iree_hal_cluster_command_buffer_vtable, &command_buffer->base);
   command_buffer->host_allocator = host_allocator;
   command_buffer->region = region;
+  command_buffer->stream_ptr = stream_ptr;
+  command_buffer->stream_capacity = stream_capacity;
   command_buffer->executable_count = 0;
+  command_buffer->record_count = 0;
   command_buffer->record_status = iree_ok_status();
   qcs_writer_init(&command_buffer->writer, stream_ptr, stream_capacity);
 
   *out_command_buffer = &command_buffer->base;
+  return iree_ok_status();
+}
+
+//===----------------------------------------------------------------------===//
+// Emit: resolve deferred records against the binding table -> QCS stream
+//===----------------------------------------------------------------------===//
+
+iree_status_t iree_hal_cluster_command_buffer_emit(
+    iree_hal_command_buffer_t* base_command_buffer,
+    iree_hal_buffer_binding_table_t binding_table) {
+  iree_hal_cluster_command_buffer_t* command_buffer =
+      iree_hal_cluster_command_buffer_cast(base_command_buffer);
+  if (!iree_status_is_ok(command_buffer->record_status)) {
+    iree_status_t status = command_buffer->record_status;
+    command_buffer->record_status = iree_ok_status();
+    return status;
+  }
+  qcs_writer_init(&command_buffer->writer, command_buffer->stream_ptr,
+                  command_buffer->stream_capacity);
+  qcs_writer_t* w = &command_buffer->writer;
+
+  for (uint32_t i = 0; i < command_buffer->record_count; ++i) {
+    const cluster_deferred_record_t* r = &command_buffer->records[i];
+    switch (r->kind) {
+      case CLUSTER_REC_DISPATCH: {
+        qcs_binding_t qcs_bindings[IREE_HAL_CLUSTER_MAX_DISPATCH_BINDINGS];
+        for (uint32_t b = 0; b < r->binding_count; ++b) {
+          uint64_t pa = 0;
+          IREE_RETURN_IF_ERROR(iree_hal_cluster_resolve_ref_to_pa(
+              command_buffer, r->bindings[b], binding_table, &pa));
+          qcs_bindings[b].device_ptr = pa;
+          qcs_bindings[b].length = (uint64_t)r->bindings[b].length;
+        }
+        int rc;
+        if (r->flags & QCS_DISPATCH_FLAG_INDIRECT) {
+          uint64_t wgc_pa = 0;
+          IREE_RETURN_IF_ERROR(iree_hal_cluster_resolve_ref_to_pa(
+              command_buffer, r->workgroup_count_ref, binding_table, &wgc_pa));
+          rc = qcs_write_dispatch_indirect(
+              w, r->executable_id, r->export_ordinal, wgc_pa,
+              r->workgroup_size, r->dynamic_local_memory, r->constant_count,
+              r->constants, r->binding_count, qcs_bindings);
+        } else {
+          rc = qcs_write_dispatch(w, r->executable_id, r->export_ordinal,
+                                  r->workgroup_count, r->workgroup_size,
+                                  r->dynamic_local_memory, r->constant_count,
+                                  r->constants, r->binding_count, qcs_bindings);
+        }
+        if (rc != 0) {
+          return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                  "QCS dispatch write overflow");
+        }
+        break;
+      }
+      case CLUSTER_REC_COPY: {
+        uint64_t src_pa = 0, dst_pa = 0;
+        IREE_RETURN_IF_ERROR(iree_hal_cluster_resolve_ref_to_pa(
+            command_buffer, r->src_ref, binding_table, &src_pa));
+        IREE_RETURN_IF_ERROR(iree_hal_cluster_resolve_ref_to_pa(
+            command_buffer, r->dst_ref, binding_table, &dst_pa));
+        if (qcs_write_copy(w, src_pa, dst_pa, r->length) != 0) {
+          return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                  "QCS copy write overflow");
+        }
+        break;
+      }
+      case CLUSTER_REC_FILL: {
+        uint64_t dst_pa = 0;
+        IREE_RETURN_IF_ERROR(iree_hal_cluster_resolve_ref_to_pa(
+            command_buffer, r->dst_ref, binding_table, &dst_pa));
+        if (qcs_write_fill(w, dst_pa, r->length, r->fill_pattern,
+                           r->fill_pattern_length) != 0) {
+          return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                  "QCS fill write overflow");
+        }
+        break;
+      }
+      case CLUSTER_REC_UPDATE: {
+        uint64_t dst_pa = 0;
+        IREE_RETURN_IF_ERROR(iree_hal_cluster_resolve_ref_to_pa(
+            command_buffer, r->dst_ref, binding_table, &dst_pa));
+        if (qcs_write_update(w, dst_pa, r->update_data, r->update_length) != 0) {
+          return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                  "QCS update write overflow");
+        }
+        break;
+      }
+    }
+  }
+  if (w->overflowed) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                            "QCS stream overflowed");
+  }
   return iree_ok_status();
 }
 
@@ -201,7 +390,7 @@ uint64_t iree_hal_cluster_command_buffer_stream_pa(
     iree_hal_command_buffer_t* base_command_buffer) {
   iree_hal_cluster_command_buffer_t* command_buffer =
       iree_hal_cluster_command_buffer_cast(base_command_buffer);
-  return qcs_ptr_to_pa(command_buffer->region, command_buffer->writer.data);
+  return qcs_ptr_to_pa(command_buffer->region, command_buffer->stream_ptr);
 }
 
 //===----------------------------------------------------------------------===//
@@ -212,10 +401,9 @@ static iree_status_t iree_hal_cluster_command_buffer_begin(
     iree_hal_command_buffer_t* base_command_buffer) {
   iree_hal_cluster_command_buffer_t* command_buffer =
       iree_hal_cluster_command_buffer_cast(base_command_buffer);
-  // Reset the stream and executable table for a fresh recording.
-  qcs_writer_init(&command_buffer->writer, command_buffer->writer.data,
-                  command_buffer->writer.capacity);
   command_buffer->executable_count = 0;
+  // Re-recording: drop refs retained by a previous begin/end cycle.
+  iree_hal_cluster_release_all_records(command_buffer);
   iree_status_ignore(command_buffer->record_status);
   command_buffer->record_status = iree_ok_status();
   return iree_ok_status();
@@ -230,15 +418,11 @@ static iree_status_t iree_hal_cluster_command_buffer_end(
     command_buffer->record_status = iree_ok_status();
     return status;
   }
-  if (command_buffer->writer.overflowed) {
-    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                            "QCS stream overflowed during recording");
-  }
   return iree_ok_status();
 }
 
 //===----------------------------------------------------------------------===//
-// Debug groups
+// Debug groups / sync (no-ops)
 //===----------------------------------------------------------------------===//
 
 static iree_status_t iree_hal_cluster_command_buffer_begin_debug_group(
@@ -247,16 +431,10 @@ static iree_status_t iree_hal_cluster_command_buffer_begin_debug_group(
     const iree_hal_label_location_t* location) {
   return iree_ok_status();
 }
-
 static iree_status_t iree_hal_cluster_command_buffer_end_debug_group(
     iree_hal_command_buffer_t* base_command_buffer) {
   return iree_ok_status();
 }
-
-//===----------------------------------------------------------------------===//
-// Synchronization (no-ops: the cluster replays synchronously in stream order)
-//===----------------------------------------------------------------------===//
-
 static iree_status_t iree_hal_cluster_command_buffer_execution_barrier(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_hal_execution_stage_t source_stage_mask,
@@ -266,22 +444,18 @@ static iree_status_t iree_hal_cluster_command_buffer_execution_barrier(
     const iree_hal_memory_barrier_t* memory_barriers,
     iree_host_size_t buffer_barrier_count,
     const iree_hal_buffer_barrier_t* buffer_barriers) {
-  // The stream is replayed in order, so barriers are implicit.
   return iree_ok_status();
 }
-
 static iree_status_t iree_hal_cluster_command_buffer_signal_event(
     iree_hal_command_buffer_t* base_command_buffer, iree_hal_event_t* event,
     iree_hal_execution_stage_t source_stage_mask) {
   return iree_ok_status();
 }
-
 static iree_status_t iree_hal_cluster_command_buffer_reset_event(
     iree_hal_command_buffer_t* base_command_buffer, iree_hal_event_t* event,
     iree_hal_execution_stage_t source_stage_mask) {
   return iree_ok_status();
 }
-
 static iree_status_t iree_hal_cluster_command_buffer_wait_events(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_host_size_t event_count, const iree_hal_event_t** events,
@@ -293,14 +467,12 @@ static iree_status_t iree_hal_cluster_command_buffer_wait_events(
     const iree_hal_buffer_barrier_t* buffer_barriers) {
   return iree_ok_status();
 }
-
 static iree_status_t iree_hal_cluster_command_buffer_advise_buffer(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_hal_buffer_ref_t buffer_ref, iree_hal_memory_advise_flags_t flags,
     uint64_t arg0, uint64_t arg1) {
   return iree_ok_status();
 }
-
 static iree_status_t iree_hal_cluster_command_buffer_collective(
     iree_hal_command_buffer_t* base_command_buffer, iree_hal_channel_t* channel,
     iree_hal_collective_op_t op, uint32_t param,
@@ -311,7 +483,7 @@ static iree_status_t iree_hal_cluster_command_buffer_collective(
 }
 
 //===----------------------------------------------------------------------===//
-// Transfer commands -> QCS records
+// Transfer commands -> deferred records
 //===----------------------------------------------------------------------===//
 
 static iree_status_t iree_hal_cluster_command_buffer_fill_buffer(
@@ -320,28 +492,17 @@ static iree_status_t iree_hal_cluster_command_buffer_fill_buffer(
     iree_host_size_t pattern_length, iree_hal_fill_flags_t flags) {
   iree_hal_cluster_command_buffer_t* command_buffer =
       iree_hal_cluster_command_buffer_cast(base_command_buffer);
-
-  uint64_t dst_pa = 0;
-  iree_status_t status = iree_hal_cluster_command_buffer_ref_to_pa(
-      command_buffer, target_ref, &dst_pa);
-  if (!iree_status_is_ok(status)) {
-    iree_hal_cluster_command_buffer_fail(command_buffer, status);
-    return iree_ok_status();
-  }
-
-  // Pack up to 8 bytes of the pattern unit into a little-endian uint64.
+  cluster_deferred_record_t* r =
+      iree_hal_cluster_alloc_record(command_buffer, CLUSTER_REC_FILL);
+  if (!r) return iree_ok_status();
+  r->dst_ref = target_ref;
+  iree_hal_cluster_retain_direct_ref(target_ref);
+  r->length = (uint64_t)target_ref.length;
   uint64_t pattern_u64 = 0;
   iree_host_size_t copy_len = pattern_length > 8 ? 8 : pattern_length;
   memcpy(&pattern_u64, pattern, copy_len);
-
-  if (qcs_write_fill(&command_buffer->writer, dst_pa,
-                     (uint64_t)target_ref.length, pattern_u64,
-                     (uint32_t)pattern_length) != 0) {
-    iree_hal_cluster_command_buffer_fail(
-        command_buffer,
-        iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                         "QCS fill write failed (overflow or bad pattern)"));
-  }
+  r->fill_pattern = pattern_u64;
+  r->fill_pattern_length = (uint32_t)pattern_length;
   return iree_ok_status();
 }
 
@@ -351,23 +512,20 @@ static iree_status_t iree_hal_cluster_command_buffer_update_buffer(
     iree_hal_update_flags_t flags) {
   iree_hal_cluster_command_buffer_t* command_buffer =
       iree_hal_cluster_command_buffer_cast(base_command_buffer);
-
-  uint64_t dst_pa = 0;
-  iree_status_t status = iree_hal_cluster_command_buffer_ref_to_pa(
-      command_buffer, target_ref, &dst_pa);
-  if (!iree_status_is_ok(status)) {
-    iree_hal_cluster_command_buffer_fail(command_buffer, status);
+  if ((uint64_t)target_ref.length > IREE_HAL_CLUSTER_INLINE_UPDATE_BYTES) {
+    iree_hal_cluster_command_buffer_fail(
+        command_buffer, iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                         "update payload too large"));
     return iree_ok_status();
   }
-
-  const uint8_t* src = (const uint8_t*)source_buffer + source_offset;
-  if (qcs_write_update(&command_buffer->writer, dst_pa, src,
-                       (uint64_t)target_ref.length) != 0) {
-    iree_hal_cluster_command_buffer_fail(
-        command_buffer,
-        iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                         "QCS update write failed (overflow)"));
-  }
+  cluster_deferred_record_t* r =
+      iree_hal_cluster_alloc_record(command_buffer, CLUSTER_REC_UPDATE);
+  if (!r) return iree_ok_status();
+  r->dst_ref = target_ref;
+  iree_hal_cluster_retain_direct_ref(target_ref);
+  r->update_length = (uint32_t)target_ref.length;
+  memcpy(r->update_data, (const uint8_t*)source_buffer + source_offset,
+         r->update_length);
   return iree_ok_status();
 }
 
@@ -377,32 +535,19 @@ static iree_status_t iree_hal_cluster_command_buffer_copy_buffer(
     iree_hal_copy_flags_t flags) {
   iree_hal_cluster_command_buffer_t* command_buffer =
       iree_hal_cluster_command_buffer_cast(base_command_buffer);
-
-  uint64_t src_pa = 0;
-  uint64_t dst_pa = 0;
-  iree_status_t status = iree_hal_cluster_command_buffer_ref_to_pa(
-      command_buffer, source_ref, &src_pa);
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_cluster_command_buffer_ref_to_pa(command_buffer,
-                                                       target_ref, &dst_pa);
-  }
-  if (!iree_status_is_ok(status)) {
-    iree_hal_cluster_command_buffer_fail(command_buffer, status);
-    return iree_ok_status();
-  }
-
-  if (qcs_write_copy(&command_buffer->writer, src_pa, dst_pa,
-                     (uint64_t)target_ref.length) != 0) {
-    iree_hal_cluster_command_buffer_fail(
-        command_buffer,
-        iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                         "QCS copy write failed (overflow)"));
-  }
+  cluster_deferred_record_t* r =
+      iree_hal_cluster_alloc_record(command_buffer, CLUSTER_REC_COPY);
+  if (!r) return iree_ok_status();
+  r->src_ref = source_ref;
+  r->dst_ref = target_ref;
+  iree_hal_cluster_retain_direct_ref(source_ref);
+  iree_hal_cluster_retain_direct_ref(target_ref);
+  r->length = (uint64_t)target_ref.length;
   return iree_ok_status();
 }
 
 //===----------------------------------------------------------------------===//
-// Dispatch -> QCS DISPATCH record
+// Dispatch -> deferred record
 //===----------------------------------------------------------------------===//
 
 static iree_status_t iree_hal_cluster_command_buffer_dispatch(
@@ -416,22 +561,25 @@ static iree_status_t iree_hal_cluster_command_buffer_dispatch(
 
   if (iree_hal_dispatch_uses_custom_arguments(flags)) {
     iree_hal_cluster_command_buffer_fail(
-        command_buffer,
-        iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                         "custom dispatch arguments not supported"));
+        command_buffer, iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                                         "custom dispatch arguments"));
     return iree_ok_status();
   }
-
   if (bindings.count > IREE_HAL_CLUSTER_MAX_DISPATCH_BINDINGS) {
     iree_hal_cluster_command_buffer_fail(
-        command_buffer,
-        iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                         "too many bindings (%" PRIhsz " > %d)", bindings.count,
-                         IREE_HAL_CLUSTER_MAX_DISPATCH_BINDINGS));
+        command_buffer, iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                         "too many bindings"));
+    return iree_ok_status();
+  }
+  if ((constants.data_length % sizeof(uint32_t)) != 0 ||
+      constants.data_length / sizeof(uint32_t) >
+          IREE_HAL_CLUSTER_MAX_CONSTANTS) {
+    iree_hal_cluster_command_buffer_fail(
+        command_buffer, iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                         "bad/too-many push constants"));
     return iree_ok_status();
   }
 
-  // Host-owned executable id.
   uint32_t executable_id = 0;
   iree_status_t status = iree_hal_cluster_command_buffer_executable_id(
       command_buffer, executable, &executable_id);
@@ -440,59 +588,32 @@ static iree_status_t iree_hal_cluster_command_buffer_dispatch(
     return iree_ok_status();
   }
 
-  // Resolve bindings -> device-PAs.
-  qcs_binding_t qcs_bindings[IREE_HAL_CLUSTER_MAX_DISPATCH_BINDINGS];
+  cluster_deferred_record_t* r =
+      iree_hal_cluster_alloc_record(command_buffer, CLUSTER_REC_DISPATCH);
+  if (!r) return iree_ok_status();
+  r->executable_id = executable_id;
+  r->export_ordinal = (uint32_t)export_ordinal;
+  r->dynamic_local_memory = config.dynamic_workgroup_local_memory;
+  r->constant_count = (uint32_t)(constants.data_length / sizeof(uint32_t));
+  if (r->constant_count) {
+    memcpy(r->constants, constants.data, constants.data_length);
+  }
+  r->binding_count = (uint32_t)bindings.count;
   for (iree_host_size_t i = 0; i < bindings.count; ++i) {
-    uint64_t pa = 0;
-    status = iree_hal_cluster_command_buffer_ref_to_pa(
-        command_buffer, bindings.values[i], &pa);
-    if (!iree_status_is_ok(status)) {
-      iree_hal_cluster_command_buffer_fail(command_buffer, status);
-      return iree_ok_status();
-    }
-    qcs_bindings[i].device_ptr = pa;
-    qcs_bindings[i].length = (uint64_t)bindings.values[i].length;
+    r->bindings[i] = bindings.values[i];
+    iree_hal_cluster_retain_direct_ref(bindings.values[i]);
   }
-
-  // Push constants are a dense uint32 array; a non-multiple-of-4 span would
-  // silently drop a trailing partial word, so reject it.
-  if ((constants.data_length % sizeof(uint32_t)) != 0) {
-    iree_hal_cluster_command_buffer_fail(
-        command_buffer,
-        iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                         "push-constant span not a multiple of 4 bytes"));
-    return iree_ok_status();
+  for (int i = 0; i < 3; ++i) {
+    r->workgroup_size[i] = config.workgroup_size[i];
   }
-  const uint32_t* constants_u32 = (const uint32_t*)constants.data;
-  uint32_t constant_count =
-      (uint32_t)(constants.data_length / sizeof(uint32_t));
-  uint32_t dyn_l1 = config.dynamic_workgroup_local_memory;
-
-  int rc;
   if (iree_hal_dispatch_uses_indirect_parameters(flags)) {
-    uint64_t wgc_pa = 0;
-    status = iree_hal_cluster_command_buffer_ref_to_pa(
-        command_buffer, config.workgroup_count_ref, &wgc_pa);
-    if (!iree_status_is_ok(status)) {
-      iree_hal_cluster_command_buffer_fail(command_buffer, status);
-      return iree_ok_status();
-    }
-    rc = qcs_write_dispatch_indirect(
-        &command_buffer->writer, executable_id, (uint32_t)export_ordinal,
-        wgc_pa, config.workgroup_size, dyn_l1, constant_count, constants_u32,
-        (uint32_t)bindings.count, qcs_bindings);
+    r->flags = QCS_DISPATCH_FLAG_INDIRECT;
+    r->workgroup_count_ref = config.workgroup_count_ref;
+    iree_hal_cluster_retain_direct_ref(config.workgroup_count_ref);
   } else {
-    rc = qcs_write_dispatch(&command_buffer->writer, executable_id,
-                            (uint32_t)export_ordinal, config.workgroup_count,
-                            config.workgroup_size, dyn_l1, constant_count,
-                            constants_u32, (uint32_t)bindings.count,
-                            qcs_bindings);
-  }
-  if (rc != 0) {
-    iree_hal_cluster_command_buffer_fail(
-        command_buffer,
-        iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                         "QCS dispatch write failed (overflow)"));
+    for (int i = 0; i < 3; ++i) {
+      r->workgroup_count[i] = config.workgroup_count[i];
+    }
   }
   return iree_ok_status();
 }
