@@ -1,0 +1,121 @@
+diff --git a/cfg/mini_gwaihir_noc.yml b/cfg/mini_gwaihir_noc.yml
+index d6af7be..4681ebc 100644
+--- a/cfg/mini_gwaihir_noc.yml
++++ b/cfg/mini_gwaihir_noc.yml
+@@ -63,10 +63,14 @@ endpoints:
+   - name: "cluster"
+     array: [2, 2]
+     addr_range:
+-      base: 0x2000_0000
+-      size: 0x0004_0000
+-      rdl_name: "snitch_cluster"
+-      en_collective: true
++      - base: 0x2000_0000
++        size: 0x0004_0000
++        rdl_name: "snitch_cluster"
++        en_collective: true
++      - base: 0x6000_0000
++        size: 0x0000_1000
++        desc: "config"
++        rdl_name: "gw_tile_regs"
+     mgr_port_protocol:
+       - "narrow_in"
+       - "wide_in"
+@@ -91,8 +95,12 @@ endpoints:
+   - name: "l2_spm"
+     array: [2]
+     addr_range:
+-      base: 0x7000_0000
+-      size: 0x0010_0000
++      - base: 0x7000_0000
++        size: 0x0010_0000
++      - base: 0x6001_0000
++        size: 0x0000_1000
++        desc: "config"
++        rdl_name: "gw_tile_regs"
+     sbr_port_protocol:
+       - "narrow_out"
+       - "wide_out"
+diff --git a/hw/cluster_tile.sv b/hw/cluster_tile.sv
+index 3662b00..3f9b8d7 100644
+--- a/hw/cluster_tile.sv
++++ b/hw/cluster_tile.sv
+@@ -56,11 +56,28 @@ module cluster_tile
+   // actual address range for this exact tile, but it is sufficient since
+   // the NoC will take care of routing the request to the correct tile.
+   localparam int unsigned NumTileAddrMapRules = 1;
++  // The TileCfg demux rule must span the *entire* cluster-config aperture so that
++  // any cluster-config request is steered to the tile-config path (the NoC then
++  // routes it to the exact destination tile -- see the NOTE above).
++  //
++  // The previous hard-coded `Sam[ClusterConfigX3Y3SamIdx].end_addr` assumed a 4x4
++  // mesh whose corner cluster is X3Y3; for any other mesh size the X3Y3 SAM index
++  // does not exist. Instead, derive the top of the cluster-config aperture in a
++  // mesh-size-agnostic way: the cluster-config regions are contiguous and equal in
++  // size (one per cluster, laid out by floogen for the cluster array endpoint), so
++  // the aperture top is the base plus NumClusters times the per-cluster region size.
++  // This is value-identical to Sam[ClusterConfigX3Y3SamIdx].end_addr on the 4x4
++  // default (0x6000_0000 + 16*0x1000 = 0x6001_0000) and correct for any NxM mesh
++  // (e.g. 2x2 mini: 0x6000_0000 + 4*0x1000 = 0x6000_4000 == ClusterConfigX1Y1 end).
++  localparam addr_t ClusterCfgBase = addr_t'(Sam[ClusterConfigX0Y0SamIdx].start_addr);
++  localparam addr_t ClusterCfgRegionSize =
++      addr_t'(Sam[ClusterConfigX0Y0SamIdx].end_addr - Sam[ClusterConfigX0Y0SamIdx].start_addr);
++  localparam addr_t ClusterCfgTop = ClusterCfgBase + addr_t'(NumClusters) * ClusterCfgRegionSize;
+   addr_rule_t [NumTileAddrMapRules-1:0] TileAddrMap = '{
+       '{
+           idx: TileCfg,
+-          start_addr: Sam[ClusterConfigX0Y0SamIdx].start_addr,
+-          end_addr: Sam[ClusterConfigX3Y3SamIdx].end_addr
++          start_addr: ClusterCfgBase,
++          end_addr: ClusterCfgTop
+       }
+   };
+   localparam int unsigned NumTileApbAddrMapRules = 1;
+diff --git a/hw/gwaihir_pkg.sv b/hw/gwaihir_pkg.sv
+index 012184a..96bf918 100644
+--- a/hw/gwaihir_pkg.sv
++++ b/hw/gwaihir_pkg.sv
+@@ -89,7 +89,18 @@ package gwaihir_pkg;
+   localparam int unsigned NumTiles = MeshDim.x * MeshDim.y;
+   localparam int unsigned NumClusters = NumClusterX * NumClusterY;
+   localparam int unsigned NumMemTiles = NumL2Spm;
+-  localparam int unsigned NumUcieTiles = NumUcie;
++  // There is always exactly one Cheshire host tile.
++  localparam int unsigned NumCheshireTiles = 1;
++  // Derive the number of UCIe tiles from the occupied mesh slots instead of the
++  // floo-generated NumUcie localparam: floogen only emits NumUcie (and the Ucie*
++  // SAM indices) when the configuration actually instantiates a UCIe endpoint, so
++  // referencing NumUcie directly breaks elaboration for any mesh without UCIe.
++  // gwaihir tiles are exclusively clusters, L2-SPM mem tiles, the Cheshire host,
++  // and UCIe tiles, therefore the UCIe count is whatever occupied slots remain.
++  // This mirrors the NumDummyTiles idiom below (mesh-size-agnostic, value-identical
++  // to NumUcie on every config: e.g. 4x4 default = 21-16-2-1 = 2, 2x2 mini = 7-4-2-1 = 0).
++  localparam int unsigned NumUcieTiles =
++      $countones(MeshMap) - NumClusters - NumMemTiles - NumCheshireTiles;
+ 
+   localparam int unsigned NumDummyTiles = NumTiles - $countones(MeshMap);
+ 
+diff --git a/hw/gwaihir_top.sv b/hw/gwaihir_top.sv
+index 97437f8..2e05e57 100644
+--- a/hw/gwaihir_top.sv
++++ b/hw/gwaihir_top.sv
+@@ -225,9 +225,18 @@ module gwaihir_top
+   // UCIe tiles //
+   ////////////////
+ 
++  // The UCIe SAM rules are the final NumUcieTiles entries of the SAM table (floogen
++  // appends the UCIe endpoint last). Derive the base index from SamNumRules and the
++  // mesh-derived UCIe tile count instead of the floo-generated Ucie0SamIdx enum value:
++  // floogen only emits Ucie0SamIdx when the configuration has a UCIe endpoint, so
++  // referencing it directly fails name resolution for any UCIe-less mesh even though
++  // this genvar loop has zero iterations there. SamNumRules and NumUcieTiles always
++  // exist, so this elaborates for every mesh and is value-identical on the 4x4 default
++  // (SamNumRules - NumUcieTiles = 40 - 2 = 38 = Ucie0SamIdx).
++  localparam int UcieSamIdxBase = int'(SamNumRules) - int'(NumUcieTiles);
+   for (genvar u = 0; u < NumUcieTiles; u++) begin : gen_ucietile
+ 
+-    localparam int UcieSamIdx = u + Ucie0SamIdx;
++    localparam int UcieSamIdx = u + UcieSamIdxBase;
+     localparam id_t UcieId = Sam[UcieSamIdx].idx;
+     localparam id_t UciePhysicalId = SamPhysical[UcieSamIdx].idx;
+     localparam int UcieX = int'(UciePhysicalId.x);

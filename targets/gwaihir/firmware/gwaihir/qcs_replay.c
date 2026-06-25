@@ -102,14 +102,28 @@ typedef struct qcs_dispatch_args_t {
   uint32_t count_x;
   uint32_t count_y;
   uint32_t count_z;
+  // When dma_fn != NULL the kernel has a Snitch DMA half whose two halves
+  // contain INTERNAL cluster-wide snrt_cluster_hw_barrier()s. Such a workgroup
+  // must be run with the SUBGROUP-BROADCAST protocol (every compute core runs
+  // compute_fn ONCE on the SAME broadcast workgroup, the DM core runs dma_fn
+  // ONCE for that SAME workgroup, in one release/rejoin pair) so every core's
+  // kernel-invocation count -- and therefore its internal-barrier count -- is
+  // identical across the cluster. `broadcast` selects that protocol; when 0
+  // (compute-only / LLVM, no internal barriers) the legacy striped grid is used
+  // (mirrors executable.c's compute_cores_are_workgroups == true).
+  uint32_t broadcast;
+  // The single workgroup the DM core is broadcasting this round (broadcast==1).
+  uint32_t bx;
+  uint32_t by;
+  uint32_t bz;
   volatile int rc;  // accumulated kernel return-code (0 == ok)
 } qcs_dispatch_args_t;
 
-// Compute-core grid loop: each compute core takes workgroups (x,y,z) whose
-// linear index == core_idx (mod n_compute), invoking the kernel for each. This
-// mirrors dispatch.c's per-core fan-out (DM core assigns, hw_barrier wakes the
-// workers, they run, hw_barrier syncs back) but striped statically so no shared
-// queue is needed for this milestone.
+// Compute-core STRIPED grid loop (compute-only / dma_fn == NULL case only):
+// each compute core takes workgroups (x,y,z) whose linear index == core_idx
+// (mod n_compute), invoking the kernel for each. Safe ONLY when the kernel has
+// no internal cluster barriers (LLVM compute-only), exactly as executable.c
+// uses for compute_cores_are_workgroups == true.
 static void qcs_replay_compute_grid(qcs_dispatch_args_t* d) {
   uint32_t core = snrt_cluster_core_idx();
   uint32_t n = snrt_cluster_compute_core_num();
@@ -135,19 +149,37 @@ static void qcs_replay_compute_grid(qcs_dispatch_args_t* d) {
   }
 }
 
-// DM-core DMA half: run dma_fn ONCE per dispatch (NOT per workgroup), exactly as
-// harness.c does (one dma_fn(&env, &state, &wg) call between the release barrier
-// and the rejoin barrier). The compute half does its own intra-kernel work
-// distribution; the DMA half streams the dispatch's data once. The DM core is
-// not a compute core, so it presents workgroup_id (0,0,0) / its own processor_id
-// -- the dma partition keys off the dispatch_state, not this id.
+// Compute-core BROADCAST step (dma_fn != NULL case): EVERY compute core runs
+// compute_fn ONCE on the one broadcast workgroup (d->bx,d->by,d->bz), mirroring
+// dispatch.c's quidditch_dispatch_queue_subgroups (which copies the same
+// workgroup_state into every core's slot). processor_id is the running core's
+// own index, exactly as dispatch.c's worker loop sets it.
+static void qcs_replay_compute_broadcast(qcs_dispatch_args_t* d) {
+  iree_hal_executable_workgroup_state_v0_t wg;
+  memset(&wg, 0, sizeof(wg));
+  wg.workgroup_id_x = d->bx;
+  wg.workgroup_id_y = d->by;
+  wg.workgroup_id_z = (uint16_t)d->bz;
+  wg.processor_id = snrt_cluster_core_idx();
+  wg.local_memory = d->local_memory;
+  wg.local_memory_size = d->local_memory_size;
+  if (d->compute_fn(&d->environment, &d->state, &wg) != 0) {
+    d->rc = QCS_REPLAY_ERR_KERNEL;
+  }
+}
+
+// DM-core DMA half: run dma_fn ONCE for the one broadcast workgroup
+// (d->bx,d->by,d->bz), exactly as executable.c calls dmaCoreFunction once per
+// workgroup between queue_subgroups (release) and wait_for_workgroup (rejoin).
+// The DM core presents the SAME workgroup id the compute cores got so both
+// halves agree on the partition; processor_id is the DM core's own index.
 static void qcs_replay_dma_half(qcs_dispatch_args_t* d) {
   if (!d->dma_fn) return;
   iree_hal_executable_workgroup_state_v0_t wg;
   memset(&wg, 0, sizeof(wg));
-  wg.workgroup_id_x = 0;
-  wg.workgroup_id_y = 0;
-  wg.workgroup_id_z = 0;
+  wg.workgroup_id_x = d->bx;
+  wg.workgroup_id_y = d->by;
+  wg.workgroup_id_z = (uint16_t)d->bz;
   wg.processor_id = snrt_cluster_core_idx();
   wg.local_memory = d->local_memory;
   wg.local_memory_size = d->local_memory_size;
@@ -291,6 +323,12 @@ static int replay_dispatch_prepare(qcs_fw_region_t* region,
 
   out->compute_fn = compute_fn;
   out->dma_fn = dma_fn;  // may be NULL: kernel has no DMA half
+  // A kernel WITH a DMA half is a Snitch kernel whose halves carry internal
+  // cluster-wide barriers; it must use the per-workgroup subgroup-broadcast
+  // protocol (one kernel invocation per core per workgroup) so internal barrier
+  // counts stay aligned. A compute-only kernel (dma_fn == NULL) has no internal
+  // barriers and uses the striped grid (mirrors executable.c).
+  out->broadcast = (dma_fn != NULL) ? 1u : 0u;
   out->count_x = count_x;
   out->count_y = count_y;
   out->count_z = count_z;
@@ -330,16 +368,67 @@ typedef enum {
 static qcs_dispatch_args_t g_args;
 static volatile qcs_phase_t g_phase;
 
+//===----------------------------------------------------------------------===//
+// DEBUG progress markers (host-readable, no RTL trace needed)
+//===----------------------------------------------------------------------===//
+// The DM core writes a monotonically increasing PHASE word + the resolved
+// binding pointers into a fixed L2-SPM scratch block so the CVA6 host can poll
+// the LAST phase the cluster reached before wedging. The block lives inside the
+// (zeroed) descriptor page, well past the ~64-byte qcs_job_descriptor_t struct
+// and below the arena floor (QCS_SHARED_ARENA_OFFSET == 4096). Layout (u64):
+//   [0] DBG_MAGIC (0x5147_4442 "QGDB") -- set once so host knows it's live
+//   [1] PHASE     (monotonic 1..N, see QCS_DBG_PHASE_*)
+//   [2] resolved binding_ptrs[0]  (A)
+//   [3] resolved binding_ptrs[1]  (B)
+//   [4] resolved binding_ptrs[2]  (C)
+//   [5] dma_fn pointer (0 == no DMA half)
+//   [6] count_x  [7] binding_count
+// Offset 0x10000 (desc) + 0x100. Host mirrors this PA in its poll loop.
+#define QCS_DBG_OFFSET 0x10100u
+#define QCS_DBG_MAGIC 0x51474442ull  // "QGDB"
+enum {
+  QCS_DBG_PHASE_DESC_OK = 1,        // descriptor validated, stream loop about to run
+  QCS_DBG_PHASE_LOOP = 2,           // entered the record loop
+  QCS_DBG_PHASE_BINDINGS = 3,       // DISPATCH: bindings resolved (ptrs written)
+  QCS_DBG_PHASE_RELEASE = 4,        // about to release workers / run dma_fn
+  QCS_DBG_PHASE_DMA_RET = 5,        // dma_fn returned (this round)
+  QCS_DBG_PHASE_REJOINED = 6,       // workers rejoined (dispatch fully done)
+  QCS_DBG_PHASE_COMPLETION = 7,     // about to write completion back
+};
+
+static volatile uint64_t* qcs_dbg_block(qcs_fw_region_t* region) {
+  return (volatile uint64_t*)qcs_fw_pa_to_ptr(region, QCS_DBG_OFFSET);
+}
+
+static void qcs_dbg_phase(qcs_fw_region_t* region, uint64_t phase) {
+  volatile uint64_t* d = qcs_dbg_block(region);
+  d[0] = QCS_DBG_MAGIC;
+  d[1] = phase;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
 int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
                       const qcs_replay_table_t* table) {
   int is_dm = snrt_is_dm_core();
 
   //===-- Compute cores: barrier-driven worker loop --------------------===//
+  // The loop is purely barrier-driven: the DM core does exactly one
+  // release/rejoin pair per "round" it publishes, and the compute cores mirror
+  // that. A round is either a whole striped dispatch (broadcast == 0) or ONE
+  // workgroup of a broadcast dispatch (broadcast == 1). In the broadcast case
+  // EVERY compute core runs compute_fn ONCE per round on the same workgroup, so
+  // every core's kernel-invocation (and hence internal-barrier) count matches
+  // the DM core's dma_fn invocation count -- no internal-barrier divergence.
   if (!is_dm) {
     for (;;) {
-      snrt_cluster_hw_barrier();  // wait for the DM core to publish a phase
+      snrt_cluster_hw_barrier();  // wait for the DM core to publish a round
       if (g_phase == QCS_PHASE_DONE) break;
-      if (g_args.compute_fn) qcs_replay_compute_grid(&g_args);
+      if (g_args.compute_fn) {
+        if (g_args.broadcast)
+          qcs_replay_compute_broadcast(&g_args);
+        else
+          qcs_replay_compute_grid(&g_args);
+      }
       snrt_cluster_hw_barrier();  // rejoin the DM core
     }
     return QCS_REPLAY_OK;
@@ -361,10 +450,12 @@ int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
                                   job->cmd_stream_len)) {
     final_rc = QCS_REPLAY_ERR_STREAM;
   } else {
+    qcs_dbg_phase(region, QCS_DBG_PHASE_DESC_OK);  // descriptor validated
     qcs_reader_t reader;
     qcs_reader_init(&reader, qcs_fw_pa_to_ptr(region, job->cmd_stream_ptr),
                     (uint32_t)job->cmd_stream_len);
 
+    qcs_dbg_phase(region, QCS_DBG_PHASE_LOOP);  // entered the record loop
     const qcs_record_header_t* header;
     while ((header = qcs_reader_next(&reader)) != NULL) {
       int rc = QCS_REPLAY_OK;
@@ -382,19 +473,55 @@ int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
           rc = replay_dispatch_prepare(region, (const qcs_dispatch_t*)header,
                                        table, &g_args);
           if (rc == QCS_REPLAY_OK && g_args.compute_fn) {
+            // DEBUG: publish the resolved bindings + dispatch shape so the host
+            // can SEE the A/B/C cluster pointers the kernel was handed.
+            {
+              volatile uint64_t* d = qcs_dbg_block(region);
+              d[2] = (uint64_t)(uintptr_t)g_args.binding_ptrs[0];
+              d[3] = (uint64_t)(uintptr_t)g_args.binding_ptrs[1];
+              d[4] = (uint64_t)(uintptr_t)g_args.binding_ptrs[2];
+              d[5] = (uint64_t)(uintptr_t)g_args.dma_fn;
+              d[6] = (uint64_t)g_args.count_x;
+              d[7] = (uint64_t)g_args.state.binding_count;
+            }
+            qcs_dbg_phase(region, QCS_DBG_PHASE_BINDINGS);
             g_args.rc = QCS_REPLAY_OK;
             g_phase = QCS_PHASE_DISPATCH;
-            snrt_cluster_hw_barrier();  // release the workers onto the grid
-            // Both halves run concurrently (mirrors harness.c lines 111-114 /
-            // dispatch.c): the compute cores run compute_fn over the grid while
-            // the DM core runs dma_fn ONCE for this dispatch. Same dispatch_state
-            // for both; dma_fn == NULL falls back to the compute-only wait. The
-            // barrier counts are unchanged (1 release + 1 rejoin per dispatch),
-            // so this stays deadlock-free: the DM core doing work between its two
-            // barriers only delays its own arrival at the rejoin barrier, exactly
-            // like a slow compute core would.
-            qcs_replay_dma_half(&g_args);
-            snrt_cluster_hw_barrier();  // rejoin
+            if (!g_args.broadcast) {
+              // Compute-only / LLVM kernel: no internal cluster barriers, so the
+              // legacy striped fan-out is safe. ONE round: release the workers
+              // onto their striped slices, run dma_fn (NULL here) once, rejoin.
+              // Mirrors executable.c's compute_cores_are_workgroups == true.
+              snrt_cluster_hw_barrier();  // release the workers onto the grid
+              qcs_replay_dma_half(&g_args);
+              snrt_cluster_hw_barrier();  // rejoin
+            } else {
+              // Snitch kernel WITH a DMA half: the kernel's two halves contain
+              // INTERNAL cluster-wide barriers, so striping would diverge the
+              // per-core invocation counts and wedge the cluster. Instead use
+              // the subgroup-broadcast protocol (executable.c lines 215-230 /
+              // dispatch.c queue_subgroups): iterate workgroups ONE AT A TIME;
+              // for each, EVERY compute core runs compute_fn once on that same
+              // workgroup and the DM core runs dma_fn once for it, inside ONE
+              // release/rejoin pair. Identical invocation counts cluster-wide
+              // => internal barriers pair up => no deadlock.
+              for (uint32_t z = 0; z < g_args.count_z; ++z) {
+                for (uint32_t y = 0; y < g_args.count_y; ++y) {
+                  for (uint32_t x = 0; x < g_args.count_x; ++x) {
+                    g_args.bx = x;
+                    g_args.by = y;
+                    g_args.bz = z;
+                    g_phase = QCS_PHASE_DISPATCH;
+                    qcs_dbg_phase(region, QCS_DBG_PHASE_RELEASE);  // -> dma_fn
+                    snrt_cluster_hw_barrier();  // release: compute_fn for (x,y,z)
+                    qcs_replay_dma_half(&g_args);  // dma_fn for (x,y,z), once
+                    qcs_dbg_phase(region, QCS_DBG_PHASE_DMA_RET);  // dma_fn done
+                    snrt_cluster_hw_barrier();     // rejoin
+                  }
+                }
+              }
+            }
+            qcs_dbg_phase(region, QCS_DBG_PHASE_REJOINED);  // all wgs done
             if (g_args.rc != QCS_REPLAY_OK) rc = g_args.rc;
           }
           break;
@@ -414,6 +541,7 @@ int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
   }
 
   // Tell the workers to exit their loop.
+  qcs_dbg_phase(region, QCS_DBG_PHASE_COMPLETION);  // stream done, about to ack
   g_phase = QCS_PHASE_DONE;
   snrt_cluster_hw_barrier();
   return final_rc;

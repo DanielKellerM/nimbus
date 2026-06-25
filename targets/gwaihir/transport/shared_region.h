@@ -33,6 +33,12 @@ typedef struct qcs_shared_region_t {
   void* base;     // this process's mmap VA of device-PA 0
   uint64_t size;  // total region bytes
   int fd;         // backing file descriptor (-1 if none)
+  // Device-PA offset at which the job descriptor lives. 0 on the dev-box
+  // Phase-1 mmap region (no firmware below it). On hardware (gwaihir L2 SPM) the
+  // qcs_replay firmware links at the region base and occupies the low pages, so
+  // the descriptor MUST be placed above it at QCS_JOB_DESCRIPTOR_OFFSET — both
+  // host and firmware agree on that PA. Set by qcs_shared_region_{create,open}.
+  uint64_t desc_offset;
 } qcs_shared_region_t;
 
 // Create (host): truncate `path` to `size` and map it shared. Zeroes the job
@@ -56,10 +62,12 @@ static inline uint64_t qcs_ptr_to_pa(const qcs_shared_region_t* region,
   return (uint64_t)((const uint8_t*)ptr - (const uint8_t*)region->base);
 }
 
-// The job descriptor lives at device-PA 0.
+// The job descriptor lives at device-PA `region->desc_offset` (0 on the dev-box
+// mmap region, QCS_JOB_DESCRIPTOR_OFFSET on hardware where firmware occupies the
+// low pages). Both host and cluster locate it through this accessor.
 static inline qcs_job_descriptor_t* qcs_shared_job(
     const qcs_shared_region_t* region) {
-  return (qcs_job_descriptor_t*)region->base;
+  return (qcs_job_descriptor_t*)((uint8_t*)region->base + region->desc_offset);
 }
 
 // Host-side bump allocator over the arena. `*bump` is the next free device-PA
