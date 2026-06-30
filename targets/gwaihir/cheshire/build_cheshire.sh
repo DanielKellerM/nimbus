@@ -20,8 +20,8 @@ EMITC=$PARENT/emitc
 HERE=$PARENT/cheshire
 cd "$HERE"
 
-# gwaihir + cheshire trees (READ-only; from the scratch gwaihir checkout).
-GW=/scratch/dankeller/snitch-compiler/gwaihir-phase2/gwaihir
+# gwaihir + cheshire trees via the in-repo .gwaihir symlink (re-point per machine, or set $GW)
+GW=${GW:-$(dirname "$IREE_SRC")/.gwaihir}
 CHS=$GW/.bender/git/checkouts/cheshire-09830518097f85c0
 GW_GEN=$GW/.generated
 
