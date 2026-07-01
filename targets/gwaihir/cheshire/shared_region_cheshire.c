@@ -14,9 +14,9 @@
 //   The qcs_replay firmware is preloaded at the cluster entry 0x70000000 and
 //   occupies the low ~64 KiB of the L2-SPM aperture (its .text/.rodata/.data/
 //   .bss). The job descriptor + command stream + A/B/C device buffers must NOT
-//   overlap that image, so we place the descriptor at QCS_DESC_OFFSET and bump-
+//   overlap that image, so we place the descriptor at QCS_JOB_DESCRIPTOR_OFFSET and bump-
 //   allocate everything above it. The firmware reads the descriptor at the same
-//   offset (its main.c QCS_JOB_DESCRIPTOR_PA must equal QCS_DESC_OFFSET).
+//   offset (its main.c QCS_JOB_DESCRIPTOR_PA must equal QCS_JOB_DESCRIPTOR_OFFSET).
 //
 // Doorbell:  qcs_doorbell_ring writes the cluster boot scratch regs + rings
 //            cl_clint_set (msip) to wake the Snitch DM core, exactly as
@@ -32,16 +32,14 @@
 #include "gw_raw_addrmap.h"
 
 // DEBUG: host-readable progress markers written by the cluster DM core (see
-// qcs_replay.c QCS_DBG_OFFSET). Header-only UART print (needs ssize_t).
+// qcs_replay.c QCS_DEBUG_BLOCK_OFFSET). Header-only UART print (needs ssize_t).
 #include <sys/types.h>
 #include "hostio.h"
 
-#ifndef QCS_DESC_OFFSET
-// 64 KiB into the L2-SPM aperture: above the qcs_replay firmware image
-// (~54 KiB: .text..bss end at 0x7000d6f8), 4 KiB-aligned. MUST match the
-// firmware's QCS_JOB_DESCRIPTOR_PA.
-#define QCS_DESC_OFFSET 0x10000u
-#endif
+// The job descriptor sits at QCS_JOB_DESCRIPTOR_OFFSET (canonical in
+// cluster_command_stream.h, pulled in via shared_region.h): 64 KiB into the
+// L2-SPM aperture, above the qcs_replay firmware image (~54 KiB, .text..bss end
+// 0x7000d6f8), 4 KiB-aligned. MUST match the firmware's QCS_JOB_DESCRIPTOR_PA.
 
 // The L2-SPM aperture base as a raw pointer. device-PA 0 == this address.
 #define L2_SPM_BASE ((uintptr_t)GW_L2_SPM_BASE_ADDR(0))
@@ -83,12 +81,12 @@ int qcs_shared_region_create(qcs_shared_region_t* region, const char* path,
   region->base = (void*)L2_SPM_BASE;
   region->size = L2_SPM_BYTES;
   region->fd = -1;
-  // The descriptor lives at QCS_DESC_OFFSET so qcs_shared_job() (and every host
+  // The descriptor lives at QCS_JOB_DESCRIPTOR_OFFSET so qcs_shared_job() (and every host
   // accessor) targets base+0x10000, ABOVE the firmware image at the region base.
-  region->desc_offset = QCS_DESC_OFFSET;
+  region->desc_offset = QCS_JOB_DESCRIPTOR_OFFSET;
   // Zero ONLY the descriptor page (NOT the whole aperture: the low 64 KiB holds
   // the preloaded firmware image and must not be clobbered).
-  volatile uint8_t* desc = (volatile uint8_t*)(L2_SPM_BASE + QCS_DESC_OFFSET);
+  volatile uint8_t* desc = (volatile uint8_t*)(L2_SPM_BASE + QCS_JOB_DESCRIPTOR_OFFSET);
   for (uint32_t i = 0; i < QCS_SHARED_ARENA_OFFSET; ++i) desc[i] = 0;
   return 0;
 }
@@ -98,7 +96,7 @@ int qcs_shared_region_open(qcs_shared_region_t* region, const char* path) {
   region->base = (void*)L2_SPM_BASE;
   region->size = L2_SPM_BYTES;
   region->fd = -1;
-  region->desc_offset = QCS_DESC_OFFSET;
+  region->desc_offset = QCS_JOB_DESCRIPTOR_OFFSET;
   return 0;
 }
 
@@ -110,14 +108,14 @@ void qcs_shared_region_close(qcs_shared_region_t* region) {
 }
 
 // Bump allocator. The bump cursor is a device-PA. We start the arena right
-// after the descriptor page (QCS_DESC_OFFSET + one page) so the descriptor,
+// after the descriptor page (QCS_JOB_DESCRIPTOR_OFFSET + one page) so the descriptor,
 // stream, and buffers never overlap the firmware image (which lives below
-// QCS_DESC_OFFSET).
+// QCS_JOB_DESCRIPTOR_OFFSET).
 uint64_t qcs_shared_alloc(qcs_shared_region_t* region, uint64_t* bump,
                           uint64_t bytes, uint64_t align) {
   if (align == 0u || (align & (align - 1u)) != 0u) return 0;
   // Floor the very first allocation to just above the descriptor page.
-  uint64_t arena_floor = QCS_DESC_OFFSET + QCS_SHARED_ARENA_OFFSET;
+  uint64_t arena_floor = QCS_JOB_DESCRIPTOR_OFFSET + QCS_SHARED_ARENA_OFFSET;
   if (*bump < arena_floor) *bump = arena_floor;
   uint64_t start = (*bump + (align - 1u)) & ~(align - 1u);
   // Reserve the LAST 4 KiB of the aperture for the simple_offload-style
@@ -173,9 +171,8 @@ void qcs_doorbell_complete(qcs_job_descriptor_t* job, uint32_t job_id,
 }
 
 // DEBUG block written by the cluster DM core (qcs_replay.c). Same fixed PA:
-// L2-SPM base + QCS_DESC_OFFSET + 0x100. u64 words [magic,phase,A,B,C,dma,cx,bc].
-#define QCS_DBG_OFFSET 0x10100u
-#define QCS_DBG_MAGIC 0x51474442ull  // "QGDB"
+// L2-SPM base + QCS_DEBUG_BLOCK_OFFSET. u64 words [magic,phase,A,B,C,dma,cx,bc].
+// QCS_DEBUG_BLOCK_OFFSET + QCS_DBG_MAGIC are canonical (cluster_command_stream.h).
 
 // Count how many (cluster,core) return-code slots have reported done (bit 0).
 // This is simple_offload.c's "all_finished" gate; here it is a boot-health
@@ -200,7 +197,7 @@ int32_t qcs_doorbell_wait_completion(qcs_job_descriptor_t* job,
   // return_code_array progress (how many of the 16*9 cores have snrt_exit'd) so
   // a boot/wake wedge is visible without an RTL trace.
   volatile uint64_t* dbg =
-      (volatile uint64_t*)(uintptr_t)(L2_SPM_BASE + QCS_DBG_OFFSET);
+      (volatile uint64_t*)(uintptr_t)(L2_SPM_BASE + QCS_DEBUG_BLOCK_OFFSET);
   const uint32_t rc_total = QCS_CLUSTER_NUM * QCS_CLUSTER_NR_CORES;
   uint64_t spins = 0;
   uint64_t last_phase = (uint64_t)-1;

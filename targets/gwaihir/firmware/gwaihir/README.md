@@ -26,13 +26,17 @@ are device-specific.
 - `app.mk` — gwaihir snitch-app build fragment.
 
 `cluster_command_stream.{h,c}` (the QCS ABI + reader) are NOT duplicated here —
-the canonical copy is [`../../transport/`](../../transport/); the gwaihir build
-vendors them into the app's `src/` alongside these files.
+the canonical copy is [`../../transport/`](../../transport/).
 
 ## Build (in the gwaihir tree)
-Copy these files (+ `transport/cluster_command_stream.{h,c}`) into
-`gwaihir/sw/snitch/apps/qcs_replay/{src,}`, then:
+Populate the gwaihir snitch-app dir from THIS repo (the source of truth) with
+[`link_into_gwaihir_tree.sh`](link_into_gwaihir_tree.sh): it symlinks the sources
+above + `../../transport/cluster_command_stream.{h,c}` + `app.mk` into
+`<gwaihir>/sw/snitch/apps/qcs_replay/{src,}`, so the RTL build compiles the
+versioned repo source, not a hand-maintained copy. It is idempotent (re-run any
+time); pass `LINK_MODE=copy` if a build step drops the symlinks. Then:
 ```
+./link_into_gwaihir_tree.sh    # gwaihir tree = <repo>/.gwaihir or $QUIDDITCH_GWAIHIR_GEN
 export SN_LLVM_BINROOT=.../riscv32-snitch-llvm-.../bin
 export CHS_SW_GCC_BINROOT=.../riscv64-gcc-12.2.0/bin
 source .venv/bin/activate
@@ -42,8 +46,10 @@ make qcs_replay        # or `make sn-apps`  (NOT SN_BUILD_APPS=ON — name colli
 compiles + links `-Werror`, zero undefined refs.
 
 ## Status / next
-Builds with a STUB kernel. Next: register the real iree+xdsl export (the SPLIT
-`<DST>_kernel.o`, symbol e.g. `gemm64_dispatch_0`) in `gw_register_kernels`, add a
-Cheshire host test (QCS writer → L2 SPM → `cl_clint_set`) modeled on
-`sw/cheshire/tests/simple_offload.c`, and stage L2 bindings into TCDM per tiling.
+The real iree+xdsl `gemm64` kernel links via the SPLIT `lib/` (registered in
+`gw_register_kernels` through the library-query path); the stub survives only
+behind `QCS_USE_STUB_KERNEL`. The host half runs on RTL (CVA6 boots from
+LLC-cached DRAM). Current blocker is downstream: the cluster cores jump to `PC=0`
+— a wake / entry-vector issue (the host must seed+wake every cluster, not just
+cluster 0). Next: resolve that, then stage L2 bindings into TCDM per tiling.
 See [`../../../../docs/host-device-split-phase2.md`](../../../../docs/host-device-split-phase2.md).
