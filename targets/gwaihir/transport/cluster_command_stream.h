@@ -38,6 +38,13 @@ extern "C" {
 // the descriptor at offset 0 collides with the firmware .text.
 #define QCS_JOB_DESCRIPTOR_OFFSET 0x10000u
 
+// The firmware's QGDB debug block (a diagnostic mirror of the dispatch phase +
+// args, "QGDB" magic) sits 0x100 above the descriptor; the host reads it from
+// this PA during its completion poll. A shared host<->firmware contract, so the
+// offset + magic are canonical here rather than re-#defined per file.
+#define QCS_DEBUG_BLOCK_OFFSET (QCS_JOB_DESCRIPTOR_OFFSET + 0x100u)
+#define QCS_DBG_MAGIC 0x51474442ull  // "QGDB"
+
 typedef enum qcs_cmd_type_e {
   QCS_CMD_DISPATCH = 1,  // replay a dispatch onto the compute cores
   QCS_CMD_COPY = 2,      // device-side iDMA copy (PA -> PA)

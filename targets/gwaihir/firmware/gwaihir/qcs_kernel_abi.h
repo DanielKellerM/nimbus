@@ -11,9 +11,12 @@
 // iree+xdsl kernel.o (compiled against the upstream header) links and is called
 // with the exact same memory layout. We vendor a minimal copy rather than the
 // full upstream header so the rv32 firmware build stays dependency-free (the
-// upstream header pulls in iree/base/*, attribute macros, etc.). When the real
-// kernel.o is wired in, this can be swapped for the upstream header; the layouts
-// match by construction.
+// upstream header pulls in iree/base/*, attribute macros, etc.). NOTE: the
+// dispatch-state / workgroup / environment layouts match upstream IREE, but the
+// export table below is a QUIDDITCH FORK extension (compute_core/dma_core split)
+// -- it must track the fork's executable_library.h, NOT upstream (which has a
+// single `ptrs` field). Do NOT "swap for upstream": the export table would
+// mismatch. The static_asserts on that struct guard the two slots we call.
 //
 // SOURCE OF TRUTH: iree/runtime/src/iree/hal/local/executable_library.h
 // (mirrored in Quidditch's runtime/runtime/src/Quidditch/executable/).
@@ -21,7 +24,8 @@
 #ifndef QCS_REPLAY_KERNEL_ABI_H_
 #define QCS_REPLAY_KERNEL_ABI_H_
 
-#include <stddef.h>
+#include <assert.h>  // static_assert (C++ keyword / C11 macro) for the layout pins
+#include <stddef.h>  // offsetof
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -100,9 +104,12 @@ typedef int (*iree_hal_executable_dispatch_v0_t)(
 //       quidditch_executable_{export_table,library}_v0_t, which adds compute_core
 //       vs dma_core split + the v0.6 params/occupancy slots).
 //
-// We only DEREFERENCE `exports.count` and `exports.compute_core_ptrs`; every
-// other table member is carried as a same-width pointer/scalar purely to keep
-// field offsets identical to the compiler's emission.
+// We DEREFERENCE `exports.count`, `exports.compute_core_ptrs`, AND
+// `exports.dma_core_ptrs` (the DMA-half fan-out; see main.c); every other table
+// member is carried as a same-width pointer/scalar purely to keep field offsets
+// identical to the compiler's emission. The static_asserts below pin the two
+// dispatch-pointer slots so a fork field inserted before dma_core_ptrs fails the
+// build instead of silently redirecting the DMA half to garbage.
 
 typedef uint32_t iree_hal_executable_library_version_t;
 typedef uint32_t iree_hal_executable_library_features_t;
@@ -137,6 +144,21 @@ typedef struct quidditch_executable_export_table_v0_t {
   const void* stage_locations;
   const iree_hal_executable_dispatch_v0_t* dma_core_ptrs;
 } quidditch_executable_export_table_v0_t;
+
+// Pin the fork's struct-of-arrays layout: the two dispatch-pointer slots the
+// replayer calls through MUST sit where the compiler emitted them. A fork field
+// inserted before dma_core_ptrs would silently redirect the DMA half to garbage;
+// this fails the build instead. Expressed in pointer widths, so it holds for
+// both the rv32 firmware and the rv64 host.
+static_assert(offsetof(quidditch_executable_export_table_v0_t, compute_core_ptrs)
+                  == sizeof(void*),
+              "compute_core_ptrs must immediately follow count");
+static_assert(offsetof(quidditch_executable_export_table_v0_t, dma_core_ptrs)
+                  == offsetof(quidditch_executable_export_table_v0_t, stage_locations)
+                         + sizeof(void*),
+              "dma_core_ptrs must be the last struct-of-arrays slot");
+static_assert(sizeof(quidditch_executable_export_table_v0_t) == 11 * sizeof(void*),
+              "fork export table = count slot + 10 pointer slots");
 
 // iree_hal_executable_constant_table_v0_t
 typedef struct iree_hal_executable_constant_table_v0_t {

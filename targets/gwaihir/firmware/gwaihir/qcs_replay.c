@@ -383,9 +383,8 @@ static volatile qcs_phase_t g_phase;
 //   [4] resolved binding_ptrs[2]  (C)
 //   [5] dma_fn pointer (0 == no DMA half)
 //   [6] count_x  [7] binding_count
-// Offset 0x10000 (desc) + 0x100. Host mirrors this PA in its poll loop.
-#define QCS_DBG_OFFSET 0x10100u
-#define QCS_DBG_MAGIC 0x51474442ull  // "QGDB"
+// At QCS_DEBUG_BLOCK_OFFSET (desc + 0x100). Host mirrors this PA in its poll loop.
+// QCS_DEBUG_BLOCK_OFFSET + QCS_DBG_MAGIC are canonical (cluster_command_stream.h).
 enum {
   QCS_DBG_PHASE_DESC_OK = 1,        // descriptor validated, stream loop about to run
   QCS_DBG_PHASE_LOOP = 2,           // entered the record loop
@@ -397,7 +396,7 @@ enum {
 };
 
 static volatile uint64_t* qcs_dbg_block(qcs_fw_region_t* region) {
-  return (volatile uint64_t*)qcs_fw_pa_to_ptr(region, QCS_DBG_OFFSET);
+  return (volatile uint64_t*)qcs_fw_pa_to_ptr(region, QCS_DEBUG_BLOCK_OFFSET);
 }
 
 static void qcs_dbg_phase(qcs_fw_region_t* region, uint64_t phase) {
