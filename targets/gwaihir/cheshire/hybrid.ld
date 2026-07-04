@@ -29,14 +29,17 @@ INCLUDE common.ldh
 MEMORY {
   /* Cheshire internal SPM: CVA6-executable + cached + coherent. 128 KiB HW. */
   chsspm (rwx) : ORIGIN = 0x10000000, LENGTH = 0x00020000
-  /* L2-SPM tile 0 above the firmware/descriptor/device-buffers: ALL host data
-   * (rodata/data, .bss, AND the host VM bump arena, stack). DRAM is
-   * non-functional on this sim, so -- now that the command-buffer bloat fix has
-   * shrunk the real VM arena need to ~sub-MB (measured on spike) -- the arena
-   * lives here as ordinary .bss, no DRAM needed. The window runs from
-   * 0x70014000 up to just below the 2 MiB SPM end (0x70200000):
-   * LENGTH = 0x70200000 - 0x70014000 = 0x001EC000 (~1.95 MiB). */
-  l2data (rw)  : ORIGIN = 0x70014000, LENGTH = 0x001EC000
+  /* L2-SPM host-data window: ALL host private data (rodata/data, .bss, the host
+   * VM bump arena, stack). MUST NOT overlap the QCS shared region the cluster
+   * reads -- the old ORIGIN 0x70014000 sat inside the device arena (bindings
+   * A/B/C land at 0x70021000+), corrupting the descriptor/bindings so the
+   * cluster never ran. L2-SPM (2 MiB) partition, provably disjoint:
+   *   [0x70010000,0x70011000) QCS descriptor + dbg block
+   *   [0x70011000,0x70040000) QCS device arena (cmd stream + A/B/C bindings)
+   *   [0x70040000,0x701ff000) host private data + stack   <-- this window
+   *   [0x701ff000,0x70200000) return_code_array (top page)
+   * LENGTH = 0x701ff000 - 0x70040000 = 0x001BF000 (~1.75 MiB). */
+  l2data (rw)  : ORIGIN = 0x70040000, LENGTH = 0x001BF000
 }
 
 SECTIONS {
