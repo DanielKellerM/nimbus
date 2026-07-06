@@ -168,15 +168,6 @@ static iree_status_t iree_hal_cluster_allocator_allocate_buffer(
 
   void* ptr = qcs_pa_to_ptr(allocator->region, pa);
 
-  // Zero-init device buffers. L2-SPM is 4-state X-initialized in the VCS co-sim,
-  // and IREE fused the linalg.fill(0) into the matmul dispatch (no fill_buffer
-  // command is emitted), so the kernel accumulates into the output binding
-  // rather than zeroing it first. Without a defined output, C = X + A@B = X.
-  // Zeroing on allocation gives the fused fill(0)+matmul a defined output
-  // (mirrors the seed's explicit C[i]=0.0). Inputs are overwritten by their host
-  // writes, so this only materially matters for the accumulate output.
-  memset(ptr, 0, (size_t)allocation_size);
-
   // The bump allocator owns the memory; the wrapping buffer just borrows it.
   iree_hal_buffer_t* buffer = NULL;
   iree_status_t status = iree_hal_heap_buffer_wrap(
