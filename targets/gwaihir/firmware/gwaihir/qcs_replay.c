@@ -505,20 +505,27 @@ int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
               // workgroup and the DM core runs dma_fn once for it, inside ONE
               // release/rejoin pair. Identical invocation counts cluster-wide
               // => internal barriers pair up => no deadlock.
-              for (uint32_t z = 0; z < g_args.count_z; ++z) {
-                for (uint32_t y = 0; y < g_args.count_y; ++y) {
-                  for (uint32_t x = 0; x < g_args.count_x; ++x) {
-                    g_args.bx = x;
-                    g_args.by = y;
-                    g_args.bz = z;
-                    g_phase = QCS_PHASE_DISPATCH;
-                    qcs_dbg_phase(region, QCS_DBG_PHASE_RELEASE);  // -> dma_fn
-                    snrt_cluster_hw_barrier();  // release: compute_fn for (x,y,z)
-                    qcs_replay_dma_half(&g_args);  // dma_fn for (x,y,z), once
-                    qcs_dbg_phase(region, QCS_DBG_PHASE_DMA_RET);  // dma_fn done
-                    snrt_cluster_hw_barrier();     // rejoin
-                  }
-                }
+              // MULTI-CLUSTER FAN-OUT: each cluster claims the LINEAR workgroups
+              // where lin % snrt_cluster_num() == snrt_cluster_idx() ({N,1,1} maps
+              // one workgroup per cluster). Pass the linear index as workgroup_id_x
+              // (bx); the kernel delinearizes it internally. The per-cluster round
+              // count K differs, but snrt_cluster_hw_barrier is intra-cluster and
+              // the compute cores mirror this DM core's rounds via g_phase, so the
+              // barrier pairing holds; the one inter-cluster sync is in main.c.
+              uint64_t total =
+                  (uint64_t)g_args.count_x * g_args.count_y * g_args.count_z;
+              uint32_t ncl = snrt_cluster_num();
+              for (uint64_t lin = snrt_cluster_idx(); lin < total; lin += ncl) {
+                g_args.bx = (uint32_t)(lin % g_args.count_x);
+                uint32_t rem = (uint32_t)(lin / g_args.count_x);
+                g_args.by = rem % g_args.count_y;
+                g_args.bz = rem / g_args.count_y;
+                g_phase = QCS_PHASE_DISPATCH;
+                qcs_dbg_phase(region, QCS_DBG_PHASE_RELEASE);  // -> dma_fn
+                snrt_cluster_hw_barrier();  // release: compute_fn for this wg
+                qcs_replay_dma_half(&g_args);  // dma_fn for this wg, once
+                qcs_dbg_phase(region, QCS_DBG_PHASE_DMA_RET);  // dma_fn done
+                snrt_cluster_hw_barrier();     // rejoin
               }
             }
             qcs_dbg_block(region)[8] = (uint64_t)(read_csr(mcycle) - _qcs_disp_t0);  // device offload cycles
