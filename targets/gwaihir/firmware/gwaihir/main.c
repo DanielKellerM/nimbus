@@ -161,20 +161,11 @@ int main() {
   // EVERY cluster's cores therefore enter snrt_main(), run snrt_init_libs() ->
   // the world=SNRT_CLUSTER_NUM global software barrier (so all 16 clusters MUST
   // arrive -- this is why the host must wake them all, and why the world=1 hack
-  // was removed), then crt0 calls main() here. ONLY cluster 0 carries the QCS
-  // job (its descriptor + command stream in L2 SPM); the other 15 clusters have
-  // no work and return immediately. On return, crt0's POST_BARRIER + snrt_exit
-  // (snitch_cluster_start.h: writes (rc<<1)|1 to scratch[0][core_idx]) reports
-  // per-core completion into the host's return_code_array -- the authoritative
-  // "all cores of all clusters done" gate the host now polls (simple_offload's
-  // protocol). Cluster 0 ADDITIONALLY writes the gemm result + descriptor
-  // completion below for the QCS no-IRQ handshake.
-  if (snrt_cluster_idx() != 0) {
-    // No QCS job for non-cluster-0 clusters: just return so crt0 reports this
-    // cluster's per-core completion (snrt_exit) and the host's all-clusters
-    // wait can resolve. Do NOT touch the descriptor (only cluster 0 owns it).
-    return 0;
-  }
+  // was removed), then crt0 calls main() here. MULTI-CLUSTER: ALL clusters replay
+  // the SAME shared QCS, each claiming only its stride of the workgroup grid
+  // (lin % snrt_cluster_num() == snrt_cluster_idx(), see qcs_replay.c) and writing
+  // its own disjoint C-block; only cluster 0 writes the descriptor completion
+  // (below), while crt0 snrt_exit reports per-core rc for every cluster.
 
   qcs_fw_region_t region;
   region.base = (uint8_t*)(uintptr_t)GW_L2_SPM_BASE_ADDR(0);
@@ -214,9 +205,13 @@ int main() {
 
   int rc = qcs_replay_stream(&region, job, &g_table);
 
+  // Inter-cluster barrier: cluster 0 must not ack completion before clusters
+  // 1..N flush their C-blocks. Every core of every cluster hits this once.
+  snrt_global_barrier();
+
   // DM core publishes the result back into the descriptor (Phase-0 handshake:
-  // status first, then completion, with a fence between).
-  if (snrt_is_dm_core()) {
+  // status first, then completion, with a fence between). Only cluster 0 owns it.
+  if (snrt_cluster_idx() == 0 && snrt_is_dm_core()) {
     qcs_job_descriptor_t* wjob = (qcs_job_descriptor_t*)job;
     wjob->status = (int32_t)rc;
     __atomic_thread_fence(__ATOMIC_RELEASE);
