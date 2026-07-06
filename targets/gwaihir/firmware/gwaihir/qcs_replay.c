@@ -486,6 +486,7 @@ int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
             qcs_dbg_phase(region, QCS_DBG_PHASE_BINDINGS);
             g_args.rc = QCS_REPLAY_OK;
             g_phase = QCS_PHASE_DISPATCH;
+            uint32_t _qcs_disp_t0 = read_csr(mcycle);  // offload ROI: DM-core dispatch fan-out start
             if (!g_args.broadcast) {
               // Compute-only / LLVM kernel: no internal cluster barriers, so the
               // legacy striped fan-out is safe. ONE round: release the workers
@@ -520,6 +521,7 @@ int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
                 }
               }
             }
+            qcs_dbg_block(region)[8] = (uint64_t)(read_csr(mcycle) - _qcs_disp_t0);  // device offload cycles
             qcs_dbg_phase(region, QCS_DBG_PHASE_REJOINED);  // all wgs done
             if (g_args.rc != QCS_REPLAY_OK) rc = g_args.rc;
           }
