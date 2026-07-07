@@ -358,15 +358,24 @@ static int replay_dispatch_prepare(qcs_fw_region_t* region,
 //   * Compute cores spin at a cluster hardware barrier; the DM core releases
 //     them (barrier) to run their slice of the grid, then both sides barrier
 //     again to rejoin before the DM core advances to the next record.
-// `g_args` and `g_phase` live in cluster L1 so every core sees the same copy.
+// `g_args`/`g_phase` MUST be per-cluster (every core of a cluster sees its own
+// cluster's copy). The firmware .bss actually lands in SHARED L2-SPM (not
+// per-cluster L1), so a single instance would be RACED by all clusters under
+// multi-cluster fan-out: each cluster writes its own workgroup index into the
+// same word and the compute cores then read whichever write won the race, so
+// workgroups get dropped/duplicated (observed bx {1,2,3,3}: wg0 unrun, wg3 twice
+// -> C[0] left uninitialized). Index by snrt_cluster_idx() so each cluster owns a
+// disjoint slot; the single-cluster {1,1,1} path is unchanged (only idx 0 runs).
 
 typedef enum {
   QCS_PHASE_DISPATCH = 0,  // run a workgroup grid
   QCS_PHASE_DONE = 1,      // stream finished, workers exit
 } qcs_phase_t;
 
-static qcs_dispatch_args_t g_args;
-static volatile qcs_phase_t g_phase;
+static qcs_dispatch_args_t g_args_percl[SNRT_CLUSTER_NUM];
+static volatile qcs_phase_t g_phase_percl[SNRT_CLUSTER_NUM];
+#define g_args (g_args_percl[snrt_cluster_idx() & (SNRT_CLUSTER_NUM - 1)])
+#define g_phase (g_phase_percl[snrt_cluster_idx() & (SNRT_CLUSTER_NUM - 1)])
 
 //===----------------------------------------------------------------------===//
 // DEBUG progress markers (host-readable, no RTL trace needed)
@@ -400,6 +409,11 @@ static volatile uint64_t* qcs_dbg_block(qcs_fw_region_t* region) {
 }
 
 static void qcs_dbg_phase(qcs_fw_region_t* region, uint64_t phase) {
+  // MULTI-CLUSTER: all clusters replay the same stream, but the debug block is a
+  // SINGLE shared L2-SPM word. Gate every debug write to cluster 0 so the 16
+  // clusters don't race on it (a lagging cluster could otherwise regress the
+  // phase marker after cluster 0 advanced it, corrupting the host's poll dump).
+  if (snrt_cluster_idx() != 0) return;
   volatile uint64_t* d = qcs_dbg_block(region);
   d[0] = QCS_DBG_MAGIC;
   d[1] = phase;
@@ -473,8 +487,11 @@ int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
                                        table, &g_args);
           if (rc == QCS_REPLAY_OK && g_args.compute_fn) {
             // DEBUG: publish the resolved bindings + dispatch shape so the host
-            // can SEE the A/B/C cluster pointers the kernel was handed.
-            {
+            // can SEE the A/B/C cluster pointers the kernel was handed. Gated to
+            // cluster 0 -- the debug block is a single shared word (see
+            // qcs_dbg_phase); all clusters resolve the same bindings so the
+            // values are identical, but only cluster 0 should touch it.
+            if (snrt_cluster_idx() == 0) {
               volatile uint64_t* d = qcs_dbg_block(region);
               d[2] = (uint64_t)(uintptr_t)g_args.binding_ptrs[0];
               d[3] = (uint64_t)(uintptr_t)g_args.binding_ptrs[1];
@@ -528,7 +545,8 @@ int qcs_replay_stream(qcs_fw_region_t* region, const qcs_job_descriptor_t* job,
                 snrt_cluster_hw_barrier();     // rejoin
               }
             }
-            qcs_dbg_block(region)[8] = (uint64_t)(read_csr(mcycle) - _qcs_disp_t0);  // device offload cycles
+            if (snrt_cluster_idx() == 0)
+              qcs_dbg_block(region)[8] = (uint64_t)(read_csr(mcycle) - _qcs_disp_t0);  // device offload cycles (cluster 0 only; shared dbg word)
             qcs_dbg_phase(region, QCS_DBG_PHASE_REJOINED);  // all wgs done
             if (g_args.rc != QCS_REPLAY_OK) rc = g_args.rc;
           }
