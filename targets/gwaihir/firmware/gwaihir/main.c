@@ -171,8 +171,15 @@ int main() {
   region.base = (uint8_t*)(uintptr_t)GW_L2_SPM_BASE_ADDR(0);
   region.size = (uint64_t)GW_L2_SPM_TOTAL_SIZE;
 
-  volatile uint64_t* _wake_dbg = (volatile uint64_t*)(region.base + QCS_DEBUG_BLOCK_OFFSET);
-  _wake_dbg[0] = QCS_DBG_MAGIC; _wake_dbg[1] = 99u;  // WAKE-PROBE: cluster 0 reached main (crt0 world barrier passed)
+  // WAKE-PROBE: cluster 0 reached main (crt0 world barrier passed). The debug
+  // block is a single shared L2-SPM word; gate to cluster 0 so the 16 clusters
+  // don't race on it (same rationale as qcs_replay.c qcs_dbg_phase).
+  if (snrt_cluster_idx() == 0) {
+    volatile uint64_t* _wake_dbg =
+        (volatile uint64_t*)(region.base + QCS_DEBUG_BLOCK_OFFSET);
+    _wake_dbg[0] = QCS_DBG_MAGIC;
+    _wake_dbg[1] = 99u;
+  }
 
   const qcs_job_descriptor_t* job =
       (const qcs_job_descriptor_t*)qcs_fw_pa_to_ptr(&region,

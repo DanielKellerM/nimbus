@@ -134,7 +134,7 @@ static void fill_inputs(double* a, double* b) {
 }
 // The kernel (runtime/samples/gemm_square/gemm_square.mlir) is matmul_transpose_b:
 //   C[i,j] = sum_k A[i,k] * B[j,k]   (NOT plain matmul a[i,k]*b[k,j]).
-// Both A and B are row-major 16x16xf64. Compute the golden accordingly.
+// Both A and B are row-major NxNxf64. Compute the golden accordingly.
 static void golden_gemm(const double* a, const double* b, double* c) {
   for (int i = 0; i < N; ++i)
     for (int j = 0; j < N; ++j) {
@@ -279,7 +279,9 @@ int main(void) {
     status = iree_vm_list_push_ref_move(inputs, &ref);
     CHECK(status, "list_push input");
   }
-  host_puts("[host] inputs A,B written into L2 SPM (2x tensor<16x16xf64>)\n");
+  host_puts("[host] inputs A,B written into L2 SPM (2x tensor<");
+  host_putu((unsigned long)N); host_puts("x"); host_putu((unsigned long)N);
+  host_puts("xf64>)\n");
 
   iree_vm_list_t* outputs = NULL;
   status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 1, allocator,
@@ -333,8 +335,10 @@ int main(void) {
   }
   host_puts("[host] C[0]=("); host_putu((unsigned long)(long)Cdev[0]);
   host_puts(") gold C[0]=("); host_putu((unsigned long)(long)C_gold[0]); host_puts(")\n");
-  host_puts("[host] C[255]=("); host_putu((unsigned long)(long)Cdev[N*N-1]);
-  host_puts(") gold C[255]=("); host_putu((unsigned long)(long)C_gold[N*N-1]); host_puts(")\n");
+  host_puts("[host] C["); host_putu((unsigned long)(N*N-1)); host_puts("]=(");
+  host_putu((unsigned long)(long)Cdev[N*N-1]);
+  host_puts(") gold C["); host_putu((unsigned long)(N*N-1)); host_puts("]=(");
+  host_putu((unsigned long)(long)C_gold[N*N-1]); host_puts(")\n");
   iree_hal_buffer_unmap_range(&omap);
 
   if (mismatches == 0) {
