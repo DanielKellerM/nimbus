@@ -76,14 +76,14 @@ static int qcs_replay_lookup(const qcs_replay_table_t* table,
 }
 
 //===----------------------------------------------------------------------===//
-// Cross-core dispatch hand-off (TCDM-resident, written by the DM core, read by
-// the compute cores after the wake barrier). Lives in cluster L1.
+// Cross-core dispatch hand-off, written by the DM core, read by the compute
+// cores after the wake barrier. g_args_percl[] lives in shared L2-SPM .bss.
 //===----------------------------------------------------------------------===//
-// The QCS ABI caps binding_count at UINT8_MAX, so the dense binding arrays are
-// bounded and can be statically sized instead of heap-allocated (no malloc on
-// the rv32 firmware data path).
-
-#define QCS_REPLAY_MAX_BINDINGS 255u
+// Static binding arrays (no rv32 malloc). Cap kept SMALL so g_args_percl[N]'s
+// .bss stays below the QCS descriptor at L2+0x10000 (memory.ld ASSERT enforces
+// it); 255 overran it at 16 clusters -> crt0 .bss-zero clobbered the descriptor
+// -> no-job hang. Over-count dispatches are rejected below.
+#define QCS_REPLAY_MAX_BINDINGS 16u
 
 typedef struct qcs_dispatch_args_t {
   // Both halves of the dispatch share the SAME environment + dispatch_state
@@ -374,6 +374,12 @@ typedef enum {
 
 static qcs_dispatch_args_t g_args_percl[SNRT_CLUSTER_NUM];
 static volatile qcs_phase_t g_phase_percl[SNRT_CLUSTER_NUM];
+// g_args_percl is in shared L2-SPM .bss and MUST end below the QCS descriptor
+// (L2+0x10000). Bound it so a MAX_BINDINGS regression can't overrun + clobber
+// the descriptor (the 16-cluster no-job hang). 8 KiB leaves room for .text+rest.
+_Static_assert(sizeof(g_args_percl) <= 8u * 1024u,
+               "g_args_percl too large for L2 .bss below the QCS descriptor "
+               "(reduce QCS_REPLAY_MAX_BINDINGS or move it to cluster L1)");
 #define g_args (g_args_percl[snrt_cluster_idx() & (SNRT_CLUSTER_NUM - 1)])
 #define g_phase (g_phase_percl[snrt_cluster_idx() & (SNRT_CLUSTER_NUM - 1)])
 
