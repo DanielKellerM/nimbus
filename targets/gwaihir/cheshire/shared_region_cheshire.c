@@ -190,53 +190,39 @@ static uint32_t qcs_return_codes_done(void) {
 
 int32_t qcs_doorbell_wait_completion(qcs_job_descriptor_t* job,
                                      uint32_t job_id) {
-  // COMPLETION GATE (mirrors the PROVEN qcs_gemm_seed.c / simple_offload.c
-  // protocol). The CVA6 dcache is NOT the problem -- the L2-SPM aperture
-  // (0x70000000, Cheshire AxiExtRegion) is OUTSIDE every CVA6 CachedRegion rule
-  // (cheshire_pkg::gen_cva6_cfg: CachedRegionAddrBase = {SPM 0x10000000, LLCOut
-  // 0x80000000, ...}) and inside the NonIdempotent range, so host loads to it
-  // are uncached. The bug is gating on job->completion ALONE: the cluster-0 DM
-  // core stores completion, then EVERY core of EVERY cluster runs crt0 snrt_exit
-  // and sets its return_code_array slot. Racing only on `completion` observed it
-  // before the write drained through the Snitch store buffer + NoC to L2, so the
-  // read returned the stale pre-job value forever. The seed instead waits for
-  // ALL (cluster,core) return-code slots (the LATER, monotone all-cores-done
-  // signal), and only THEN -- with an explicit fence -- reads completion+status,
-  // by which point the earlier completion store is guaranteed visible.
+  // COMPLETION GATE: gate on the SINGLE descriptor completion word. Cluster-0's
+  // DM core writes job->completion=job_id with an explicit fence AFTER the
+  // inter-cluster global barrier (main.c), so completion==job_id already implies
+  // every cluster finished AND the store drained through the Snitch store buffer
+  // + NoC to L2 -- the volatile view + per-spin fence force a fresh uncached
+  // L2 read (no CSE/hoist), which is the real fix for the earlier "flaky" read.
+  // Do NOT scan the return-code array on the gate hot path: it is
+  // QCS_CLUSTER_NUM*QCS_CLUSTER_NR_CORES uncached NoC loads (144 at 16 clusters),
+  // ~ms of SIM-TIME per iteration, so the host polled only ~twice per run and the
+  // VCS wall-clock killed the sim before it observed the already-set completion.
+  // Scan the slots only for the (rare) progress print.
   volatile uint64_t* dbg =
       (volatile uint64_t*)(uintptr_t)(L2_SPM_BASE + QCS_DEBUG_BLOCK_OFFSET);
-  // volatile view of the descriptor so completion/status are re-read from L2 on
-  // every poll (no CSE/hoist) rather than trusting the __atomic acquire alone.
   volatile qcs_job_descriptor_t* vjob = (volatile qcs_job_descriptor_t*)job;
   const uint32_t rc_total = QCS_CLUSTER_NUM * QCS_CLUSTER_NR_CORES;
   uint64_t spins = 0;
   uint64_t last_phase = (uint64_t)-1;
-  uint32_t last_rc_done = (uint32_t)-1;
   for (;;) {
-    // Primary gate: all cores of all clusters have snrt_exit'd. This is emitted
-    // AFTER the cluster-0 completion store, so once it holds the completion word
-    // is already flushed to L2 (a fence makes the ordering explicit for CVA6).
-    uint32_t rc_done_now = qcs_return_codes_done();
     __asm__ volatile("fence" ::: "memory");
-    uint32_t done = vjob->completion;
-    // Terminal only when BOTH hold (the seed's proven protocol): all cores of
-    // all clusters have snrt_exit'd AND the descriptor completion word carries
-    // this job id. The all-cores-done signal is emitted after the completion
-    // store, so requiring it guarantees the completion write has drained to L2;
-    // both are re-read from L2 each spin via the volatile view + fence.
-    if (done == job_id && rc_done_now == rc_total) {
+    if (vjob->completion == job_id) {
+      host_puts("[host] poll: COMPLETE cores_done=");
+      host_putu((unsigned long)qcs_return_codes_done());  // once, for the report
+      host_puts("/"); host_putu((unsigned long)rc_total); host_puts("\n");
       return vjob->status;
     }
-    // Print on every phase change, every return-code-progress change, AND every
-    // ~4M spins so a wedge is visible.
+    // Progress print on phase change or every ~4M spins (the 144-slot scan runs
+    // only inside this branch, never on the gate hot path).
     uint64_t phase = (dbg[0] == QCS_DBG_MAGIC) ? dbg[1] : 0;
-    if (phase != last_phase || rc_done_now != last_rc_done ||
-        (spins & 0x3fffffull) == 0) {
+    if (phase != last_phase || (spins & 0x3fffffull) == 0) {
       last_phase = phase;
-      last_rc_done = rc_done_now;
       host_puts("[host] poll: cluster PHASE=");
       host_putu((unsigned long)phase);
-      host_puts(" cores_done="); host_putu((unsigned long)rc_done_now);
+      host_puts(" cores_done="); host_putu((unsigned long)qcs_return_codes_done());
       host_puts("/"); host_putu((unsigned long)rc_total);
       if (dbg[0] == QCS_DBG_MAGIC) {
         host_puts(" A=0x"); host_puthex64(dbg[2]);
