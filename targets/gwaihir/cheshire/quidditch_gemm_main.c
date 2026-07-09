@@ -48,10 +48,11 @@
 // update bytes heap-allocated on demand) the command buffer is ~tens of KiB and
 // the real arena need is sub-MB. So the arena goes BACK into L2-SPM as ordinary
 // .bss (.arena NOLOAD in l2data; see hybrid.ld) -- DRAM is non-functional on
-// this sim. 1 MiB is a comfortable margin over the measured spike HWM and fits
-// l2data (~1.95 MiB) alongside host text/data/stack. NOLOAD keeps crt0 from
-// zeroing it under the slow sim; the bump allocator zeroes CALLOC bytes.
-#define HOST_ARENA_BYTES (1 * 1024 * 1024)
+// this sim. 384 KiB = ~1.9x the measured peak: 112 KiB context (hwm 0x1c038, 4x4
+// RTL run) + one 92 KiB command buffer allocated at invoke. host_arena_ctl's
+// ARENA-EXHAUSTED print + g_arena_hwm catch any regression. NOLOAD keeps crt0
+// from zeroing it under the slow sim; the bump allocator zeroes CALLOC bytes.
+#define HOST_ARENA_BYTES (384 * 1024)
 static uint8_t g_arena[HOST_ARENA_BYTES]
     __attribute__((aligned(64), section(".arena")));
 static iree_host_size_t g_arena_off = 0;
