@@ -123,7 +123,7 @@ static void host_print_status(iree_status_t st) {
     }                                                                        \
   } while (0)
 
-#define N 16
+#define N 64
 
 // Reference A,B fill (deterministic) and the golden C = A @ B (row-major f64).
 static void fill_inputs(double* a, double* b) {
