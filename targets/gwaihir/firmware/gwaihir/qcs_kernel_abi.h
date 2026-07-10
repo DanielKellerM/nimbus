@@ -129,37 +129,6 @@ typedef struct iree_hal_executable_import_table_v0_t {
   const char* const* symbols;
 } iree_hal_executable_import_table_v0_t;
 
-// quidditch_executable_export_table_v0_t (struct-of-arrays, fork layout).
-// Only `count` + `compute_core_ptrs` are read; the rest preserve offsets.
-typedef struct quidditch_executable_export_table_v0_t {
-  uint32_t count;
-  const iree_hal_executable_dispatch_v0_t* compute_core_ptrs;
-  const void* attrs;
-  const void* params;
-  const void* occupancy;
-  const char* const* names;
-  const char* const* tags;
-  const char* const* parameter_names;
-  const void* source_locations;
-  const void* stage_locations;
-  const iree_hal_executable_dispatch_v0_t* dma_core_ptrs;
-} quidditch_executable_export_table_v0_t;
-
-// Pin the fork's struct-of-arrays layout: the two dispatch-pointer slots the
-// replayer calls through MUST sit where the compiler emitted them. A fork field
-// inserted before dma_core_ptrs would silently redirect the DMA half to garbage;
-// this fails the build instead. Expressed in pointer widths, so it holds for
-// both the rv32 firmware and the rv64 host.
-static_assert(offsetof(quidditch_executable_export_table_v0_t, compute_core_ptrs)
-                  == sizeof(void*),
-              "compute_core_ptrs must immediately follow count");
-static_assert(offsetof(quidditch_executable_export_table_v0_t, dma_core_ptrs)
-                  == offsetof(quidditch_executable_export_table_v0_t, stage_locations)
-                         + sizeof(void*),
-              "dma_core_ptrs must be the last struct-of-arrays slot");
-static_assert(sizeof(quidditch_executable_export_table_v0_t) == 11 * sizeof(void*),
-              "fork export table = count slot + 10 pointer slots");
-
 // iree_hal_executable_constant_table_v0_t
 typedef struct iree_hal_executable_constant_table_v0_t {
   uint32_t count;
@@ -171,14 +140,9 @@ typedef struct iree_hal_executable_source_file_table_v0_t {
   const void* files;
 } iree_hal_executable_source_file_table_v0_t;
 
-// quidditch_executable_library_v0_t
-typedef struct quidditch_executable_library_v0_t {
-  const iree_hal_executable_library_header_t* header;
-  iree_hal_executable_import_table_v0_t imports;
-  quidditch_executable_export_table_v0_t exports;
-  iree_hal_executable_constant_table_v0_t constants;
-  iree_hal_executable_source_file_table_v0_t sources;
-} quidditch_executable_library_v0_t;
+// The fork export-table + library structs (shared with the rv64 runtime and the
+// compiler emission); needs the base iree_hal_* types declared above.
+#include "quidditch_executable_abi.h"
 
 // The library query function signature (matches IREE's
 // iree_hal_executable_library_query_fn_t). Returns a pointer to the library
