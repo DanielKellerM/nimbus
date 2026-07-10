@@ -27,6 +27,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/../../../.." && pwd)
 fw_dir="$here"                                   # firmware sources (this dir)
 tp_dir="$repo/runtime/host/transport"            # QCS ABI + reader (canonical)
+rt_dir="$repo/runtime/runtime/src/Quidditch"     # shared executable-ABI header
 
 gw="${1:-${QUIDDITCH_GWAIHIR_GEN:-$repo/.gwaihir}}"
 mode="${LINK_MODE:-symlink}"
@@ -44,6 +45,7 @@ mkdir -p "$src_dir" "$app_dir/lib"
 # Canonical sources, by home dir. app.mk (the build fragment) is versioned too.
 fw_srcs="main.c qcs_replay.c qcs_replay.h qcs_kernel_abi.h qcs_world_comm.c quidditch_snrt_exports.c"
 tp_srcs="cluster_command_stream.c cluster_command_stream.h"
+rt_srcs="quidditch_executable_abi.h"
 
 wire() { # <abs-source> <dest>
   [ -f "$1" ] || { echo "ERROR: missing canonical source: $1" >&2; exit 1; }
@@ -53,6 +55,7 @@ wire() { # <abs-source> <dest>
 
 for f in $fw_srcs; do wire "$fw_dir/$f" "$src_dir/$f"; done
 for f in $tp_srcs; do wire "$tp_dir/$f" "$src_dir/$f"; done
+for f in $rt_srcs; do wire "$rt_dir/$f" "$src_dir/$f"; done
 wire "$fw_dir/app.mk" "$app_dir/app.mk"
 
 # Optional: the SPLIT iree+xdsl kernel static-lib (a generated artifact).

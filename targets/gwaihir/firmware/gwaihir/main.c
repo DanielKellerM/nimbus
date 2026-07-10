@@ -97,20 +97,6 @@ __attribute__((unused)) static int qcs_stub_kernel(
 // Maps (executable_id, export_ordinal) -> kernel fn. The host's QCS DISPATCH
 // records carry these indices; they must agree with the executable table the
 // host compiled against (qcs_job_descriptor_t.executable_table_id).
-//
-// NEXT STEP — real kernel: the iree+xdsl split emits a kernel object whose
-// export symbol is e.g. `gemm64_dispatch_0` (the xDSL module name +
-// `_dispatch_<ordinal>`), declared as an iree_hal_executable_dispatch_v0_t.
-// Declare it `extern` here and register it for the matching ids:
-//     extern int gemm64_dispatch_0(
-//         const iree_hal_executable_environment_v0_t*,
-//         const iree_hal_executable_dispatch_state_v0_t*,
-//         const iree_hal_executable_workgroup_state_v0_t*);
-//     qcs_replay_register(table, /*executable_id=*/0, /*export_ordinal=*/0,
-//                         gemm64_dispatch_0);
-// and add the kernel .o/.a to SRCS / a per-app LIB in app.mk. (IREE's
-// static-library query header `iree_hal_executable_library_query` is the other
-// integration option: register every export from the library_v0 table.)
 static void gw_register_kernels(qcs_replay_table_t* table) {
   qcs_replay_table_init(table);
 #ifdef QCS_USE_STUB_KERNEL
@@ -129,8 +115,10 @@ static void gw_register_kernels(qcs_replay_table_t* table) {
   // the v0.6 library_query returns NULL when it is < 6 (VERSION_0_6).
   const iree_hal_executable_library_header_t** lib_hdr =
       quidditch_gemm64_dispatch_0_library_query(
-          /*max_version=*/6u, /*environment=*/NULL);
-  if (lib_hdr) {
+          /*max_version=*/QUIDDITCH_EXECUTABLE_LIBRARY_VERSION_LATEST,
+          /*environment=*/NULL);
+  if (lib_hdr &&
+      (*lib_hdr)->version == QUIDDITCH_EXECUTABLE_LIBRARY_VERSION_LATEST) {
     const quidditch_executable_library_v0_t* lib =
         (const quidditch_executable_library_v0_t*)lib_hdr;
     for (uint32_t ord = 0; ord < lib->exports.count; ++ord) {
