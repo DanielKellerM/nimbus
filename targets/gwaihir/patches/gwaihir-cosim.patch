@@ -1,0 +1,850 @@
+diff --git a/cfg/mini_gwaihir_noc.yml b/cfg/mini_gwaihir_noc.yml
+index d6af7be..4681ebc 100644
+--- a/cfg/mini_gwaihir_noc.yml
++++ b/cfg/mini_gwaihir_noc.yml
+@@ -63,10 +63,14 @@ endpoints:
+   - name: "cluster"
+     array: [2, 2]
+     addr_range:
+-      base: 0x2000_0000
+-      size: 0x0004_0000
+-      rdl_name: "snitch_cluster"
+-      en_collective: true
++      - base: 0x2000_0000
++        size: 0x0004_0000
++        rdl_name: "snitch_cluster"
++        en_collective: true
++      - base: 0x6000_0000
++        size: 0x0000_1000
++        desc: "config"
++        rdl_name: "gw_tile_regs"
+     mgr_port_protocol:
+       - "narrow_in"
+       - "wide_in"
+@@ -91,8 +95,12 @@ endpoints:
+   - name: "l2_spm"
+     array: [2]
+     addr_range:
+-      base: 0x7000_0000
+-      size: 0x0010_0000
++      - base: 0x7000_0000
++        size: 0x0010_0000
++      - base: 0x6001_0000
++        size: 0x0000_1000
++        desc: "config"
++        rdl_name: "gw_tile_regs"
+     sbr_port_protocol:
+       - "narrow_out"
+       - "wide_out"
+diff --git a/hw/cheshire_tile.sv b/hw/cheshire_tile.sv
+index 0b911f0..2c8e3de 100644
+--- a/hw/cheshire_tile.sv
++++ b/hw/cheshire_tile.sv
+@@ -369,24 +369,58 @@ module cheshire_tile
+   assign reg_req_o                                   = reg_ext_req[CshRegExtChipCtrl:CshRegExtFLL];
+   assign reg_ext_rsp[CshRegExtChipCtrl:CshRegExtFLL] = reg_rsp_i;
+ 
+-  // LLC master port tied to an error slave (no external DRAM via serial link)
+-  axi_err_slv #(
+-    .AxiIdWidth(CheshireCfg.AxiMstIdWidth + $clog2(
+-        csh_axi__AxiIn.num_in
+-    ) + CheshireCfg.LlcNotBypass),
+-    .axi_req_t(csh_axi_llc_req_t),
+-    .axi_resp_t(csh_axi_llc_rsp_t),
+-    .Resp(axi_pkg::RESP_DECERR),
+-    .RespWidth(CheshireCfg.AxiDataWidth),
+-    .RespData(64'hCA11AB1EBADCAB1E),
+-    .ATOPs(1'b1),
+-    .MaxTrans(4)  // TODO maybe tune, but this block should never be used.
+-  ) i_llc_err_slv (
++  // LLC master port backed by a simulation memory model so that external DRAM
++  // (LlcOutRegionStart .. End, base 0x8000_0000) is a real, functional,
++  // CVA6-executable+cached backing store in co-simulation. The memory array is
++  // reachable for testbench backdoor access as
++  //   fix.dut.i_cheshire_tile.i_llc_sim_mem.mem
++  // axi_sim_mem does not support ATOPs, which is fine: atomics are resolved in
++  // the LLC/Cheshire crossbar before reaching this master port.
++  // axi_sim_mem ports are NumPorts-wide unpacked arrays; wrap the scalar LLC
++  // master signals into 1-element arrays for connection.
++  csh_axi_llc_req_t [0:0] llc_sim_mem_req;
++  csh_axi_llc_rsp_t [0:0] llc_sim_mem_rsp;
++  assign llc_sim_mem_req[0] = axi_llc_req;
++  assign axi_llc_rsp        = llc_sim_mem_rsp[0];
++
++  // IdWidth derived directly from the LLC AW id field ($bits) -- robust against
++  // the exact width arithmetic. Delays mirror the UPSTREAM Cheshire DRAM
++  // sim_mem (vip_cheshire_soc.sv: ApplDelay = ClkPeriodSys*0.1 = 0.5ns,
++  // AcqDelay = ClkPeriodSys*0.9 = 4.5ns at a 5ns system clock). ZERO delays
++  // cause an AW/W same-cycle sampling race -> "Expected last beat of W burst!"
++  // assertion flood; non-zero delays sample AW before W deterministically.
++  axi_sim_mem #(
++    .AddrWidth        (CheshireCfg.AddrWidth),
++    .DataWidth        (CheshireCfg.AxiDataWidth),
++    .IdWidth          ($bits(axi_llc_req.aw.id)),
++    .UserWidth        (CheshireCfg.AxiUserWidth),
++    .NumPorts         (32'd1),
++    .axi_req_t        (csh_axi_llc_req_t),
++    .axi_rsp_t        (csh_axi_llc_rsp_t),
++    .WarnUninitialized(1'b0),
++    .UninitializedData("zeros"),
++    .ClearErrOnAccess (1'b1),
++    .ApplDelay        (0.5ns),
++    .AcqDelay         (4.5ns)
++  ) i_llc_sim_mem (
+     .clk_i,
+     .rst_ni,
+-    .test_i    (test_mode_i),
+-    .slv_req_i (axi_llc_req),
+-    .slv_resp_o(axi_llc_rsp)
++    .axi_req_i         (llc_sim_mem_req),
++    .axi_rsp_o         (llc_sim_mem_rsp),
++    .mon_w_valid_o     (),
++    .mon_w_addr_o      (),
++    .mon_w_data_o      (),
++    .mon_w_id_o        (),
++    .mon_w_user_o      (),
++    .mon_w_beat_count_o(),
++    .mon_w_last_o      (),
++    .mon_r_valid_o     (),
++    .mon_r_addr_o      (),
++    .mon_r_data_o      (),
++    .mon_r_id_o        (),
++    .mon_r_user_o      (),
++    .mon_r_beat_count_o(),
++    .mon_r_last_o      ()
+   );
+ 
+   // Add Assertion that no multicast / reduction can enter this tile!
+diff --git a/hw/cluster_tile.sv b/hw/cluster_tile.sv
+index 3662b00..3f9b8d7 100644
+--- a/hw/cluster_tile.sv
++++ b/hw/cluster_tile.sv
+@@ -56,11 +56,28 @@ module cluster_tile
+   // actual address range for this exact tile, but it is sufficient since
+   // the NoC will take care of routing the request to the correct tile.
+   localparam int unsigned NumTileAddrMapRules = 1;
++  // The TileCfg demux rule must span the *entire* cluster-config aperture so that
++  // any cluster-config request is steered to the tile-config path (the NoC then
++  // routes it to the exact destination tile -- see the NOTE above).
++  //
++  // The previous hard-coded `Sam[ClusterConfigX3Y3SamIdx].end_addr` assumed a 4x4
++  // mesh whose corner cluster is X3Y3; for any other mesh size the X3Y3 SAM index
++  // does not exist. Instead, derive the top of the cluster-config aperture in a
++  // mesh-size-agnostic way: the cluster-config regions are contiguous and equal in
++  // size (one per cluster, laid out by floogen for the cluster array endpoint), so
++  // the aperture top is the base plus NumClusters times the per-cluster region size.
++  // This is value-identical to Sam[ClusterConfigX3Y3SamIdx].end_addr on the 4x4
++  // default (0x6000_0000 + 16*0x1000 = 0x6001_0000) and correct for any NxM mesh
++  // (e.g. 2x2 mini: 0x6000_0000 + 4*0x1000 = 0x6000_4000 == ClusterConfigX1Y1 end).
++  localparam addr_t ClusterCfgBase = addr_t'(Sam[ClusterConfigX0Y0SamIdx].start_addr);
++  localparam addr_t ClusterCfgRegionSize =
++      addr_t'(Sam[ClusterConfigX0Y0SamIdx].end_addr - Sam[ClusterConfigX0Y0SamIdx].start_addr);
++  localparam addr_t ClusterCfgTop = ClusterCfgBase + addr_t'(NumClusters) * ClusterCfgRegionSize;
+   addr_rule_t [NumTileAddrMapRules-1:0] TileAddrMap = '{
+       '{
+           idx: TileCfg,
+-          start_addr: Sam[ClusterConfigX0Y0SamIdx].start_addr,
+-          end_addr: Sam[ClusterConfigX3Y3SamIdx].end_addr
++          start_addr: ClusterCfgBase,
++          end_addr: ClusterCfgTop
+       }
+   };
+   localparam int unsigned NumTileApbAddrMapRules = 1;
+diff --git a/hw/gwaihir_pkg.sv b/hw/gwaihir_pkg.sv
+index 012184a..96bf918 100644
+--- a/hw/gwaihir_pkg.sv
++++ b/hw/gwaihir_pkg.sv
+@@ -89,7 +89,18 @@ package gwaihir_pkg;
+   localparam int unsigned NumTiles = MeshDim.x * MeshDim.y;
+   localparam int unsigned NumClusters = NumClusterX * NumClusterY;
+   localparam int unsigned NumMemTiles = NumL2Spm;
+-  localparam int unsigned NumUcieTiles = NumUcie;
++  // There is always exactly one Cheshire host tile.
++  localparam int unsigned NumCheshireTiles = 1;
++  // Derive the number of UCIe tiles from the occupied mesh slots instead of the
++  // floo-generated NumUcie localparam: floogen only emits NumUcie (and the Ucie*
++  // SAM indices) when the configuration actually instantiates a UCIe endpoint, so
++  // referencing NumUcie directly breaks elaboration for any mesh without UCIe.
++  // gwaihir tiles are exclusively clusters, L2-SPM mem tiles, the Cheshire host,
++  // and UCIe tiles, therefore the UCIe count is whatever occupied slots remain.
++  // This mirrors the NumDummyTiles idiom below (mesh-size-agnostic, value-identical
++  // to NumUcie on every config: e.g. 4x4 default = 21-16-2-1 = 2, 2x2 mini = 7-4-2-1 = 0).
++  localparam int unsigned NumUcieTiles =
++      $countones(MeshMap) - NumClusters - NumMemTiles - NumCheshireTiles;
+ 
+   localparam int unsigned NumDummyTiles = NumTiles - $countones(MeshMap);
+ 
+diff --git a/hw/gwaihir_top.sv b/hw/gwaihir_top.sv
+index 97437f8..2e05e57 100644
+--- a/hw/gwaihir_top.sv
++++ b/hw/gwaihir_top.sv
+@@ -225,9 +225,18 @@ module gwaihir_top
+   // UCIe tiles //
+   ////////////////
+ 
++  // The UCIe SAM rules are the final NumUcieTiles entries of the SAM table (floogen
++  // appends the UCIe endpoint last). Derive the base index from SamNumRules and the
++  // mesh-derived UCIe tile count instead of the floo-generated Ucie0SamIdx enum value:
++  // floogen only emits Ucie0SamIdx when the configuration has a UCIe endpoint, so
++  // referencing it directly fails name resolution for any UCIe-less mesh even though
++  // this genvar loop has zero iterations there. SamNumRules and NumUcieTiles always
++  // exist, so this elaborates for every mesh and is value-identical on the 4x4 default
++  // (SamNumRules - NumUcieTiles = 40 - 2 = 38 = Ucie0SamIdx).
++  localparam int UcieSamIdxBase = int'(SamNumRules) - int'(NumUcieTiles);
+   for (genvar u = 0; u < NumUcieTiles; u++) begin : gen_ucietile
+ 
+-    localparam int UcieSamIdx = u + Ucie0SamIdx;
++    localparam int UcieSamIdx = u + UcieSamIdxBase;
+     localparam id_t UcieId = Sam[UcieSamIdx].idx;
+     localparam id_t UciePhysicalId = SamPhysical[UcieSamIdx].idx;
+     localparam int UcieX = int'(UciePhysicalId.x);
+diff --git a/sw/cheshire/tests/access_clk_gating_rst_ctrl_reg.c b/sw/cheshire/tests/access_clk_gating_rst_ctrl_reg.c
+deleted file mode 100644
+index 4c65df5..0000000
+--- a/sw/cheshire/tests/access_clk_gating_rst_ctrl_reg.c
++++ /dev/null
+@@ -1,38 +0,0 @@
+-// Copyright 2023 ETH Zurich and University of Bologna.
+-// Licensed under the Apache License, Version 2.0, see LICENSE for details.
+-// SPDX-License-Identifier: Apache-2.0
+-//
+-// Cyrill Durrer <cdurrer@iis.ee.ethz.ch>
+-
+-#include "gw_addrmap.h"
+-#include "gw_raw_addrmap.h"
+-
+-// The clock-gating and reset control are now per-tile registers, exposed via
+-// the per-tile config blocks. Each tile holds a single clock-enable bit
+-// (clk.en) and a single active-low reset bit (rst.n).
+-
+-int main(void) {
+-
+-    uint32_t n_errors = 2 * (GW_CLUSTER_NUM + GW_L2_SPM_NUM);
+-
+-    volatile gw_tile_regs__stride1000_t *cluster_cfg = gwaihir_addrmap.cluster_config;
+-    volatile gw_tile_regs__stride1000_t *mem_cfg = gwaihir_addrmap.l2_spm_config;
+-
+-    // Write and read back the clock-enable and reset bits of every cluster tile
+-    for (int i = 0; i < GW_CLUSTER_NUM; i++) {
+-        cluster_cfg[i].clk.f.en = 0x1;
+-        cluster_cfg[i].rst.f.n = 0x1;
+-        n_errors -= (cluster_cfg[i].clk.f.en == 0x1);
+-        n_errors -= (cluster_cfg[i].rst.f.n == 0x1);
+-    }
+-
+-    // Write and read back the clock-enable and reset bits of every memory tile
+-    for (int i = 0; i < GW_L2_SPM_NUM; i++) {
+-        mem_cfg[i].clk.f.en = 0x1;
+-        mem_cfg[i].rst.f.n = 0x1;
+-        n_errors -= (mem_cfg[i].clk.f.en == 0x1);
+-        n_errors -= (mem_cfg[i].rst.f.n == 0x1);
+-    }
+-
+-    return n_errors;
+-}
+diff --git a/sw/snitch/runtime/impl/snitch_cluster_start.h b/sw/snitch/runtime/impl/snitch_cluster_start.h
+index f791a51..49ce967 100644
+--- a/sw/snitch/runtime/impl/snitch_cluster_start.h
++++ b/sw/snitch/runtime/impl/snitch_cluster_start.h
+@@ -12,6 +12,11 @@
+ #define SNRT_INIT_CLS
+ #define SNRT_INIT_LIBS
+ #define SNRT_CRT0_PRE_BARRIER
++// NOTE: an SNRT_CRT0_CALLBACK1 wake marker that stored to L2-SPM (0x70010100)
++// this early in crt0 WEDGED the run (cluster/NoC hang at ~103ms, host poll
++// back-pressured) -- a snitch-core store to external memory before the cluster
++// memory path is up. Removed; use the firmware's own dbg phases + a host-side
++// C[0] dump instead (which reaches the poll on the run2-proven path).
+ #define SNRT_INVOKE_MAIN
+ #define SNRT_CRT0_POST_BARRIER
+ #define SNRT_CRT0_EXIT
+diff --git a/sw/sw.mk b/sw/sw.mk
+index f5ae51c..cf27cfa 100644
+--- a/sw/sw.mk
++++ b/sw/sw.mk
+@@ -48,6 +48,7 @@ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/fused_concat_linear
+ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/mha
+ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/summa_gemm
+ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/power_benchmarks
++SN_APPS += $(GW_SNITCH_SW_DIR)/apps/qcs_replay
+ 
+ SN_TESTS = $(wildcard $(GW_SNITCH_SW_DIR)/tests/*.c)
+ 
+diff --git a/target/sim/include/tb_gwaihir_tasks.svh b/target/sim/include/tb_gwaihir_tasks.svh
+index 2548d8e..eeb6c15 100644
+--- a/target/sim/include/tb_gwaihir_tasks.svh
++++ b/target/sim/include/tb_gwaihir_tasks.svh
+@@ -155,6 +155,73 @@ task automatic fastmode_elf_preload(input string binary, output cheshire_pkg::do
+   $display("[FAST_PRELOAD] Preload complete");
+ endtask
+ 
++// Phase-2 HYBRID host preload. The host ELF has two segments:
++//   .text @ 0x10000000  -> Cheshire internal SPM: CVA6-executable + cached +
++//                          coherent. Loaded over JTAG (the fastmode backdoor
++//                          only reaches the L2-SPM tc_srams, and the Cheshire
++//                          SPM lives inside the SoC). .text is ~121 KiB so the
++//                          slow JTAG path is tolerable.
++//   .misc/.bss @ 0x70014000 -> L2-SPM: CVA6 load/store-accessible (NOT fetch),
++//                          shared with the cluster firmware. Backdoor-loaded
++//                          via the fastmode tc_sram write path (instant).
++// Requires the hart to be halted (jtag_wait_for_llc_config_halt) before the
++// JTAG section load. Returns the ELF entry (0x10000000).
++task automatic hybrid_host_elf_preload(input string binary, output cheshire_pkg::doub_bt entry);
++  import floo_gwaihir_noc_pkg::*;
++  longint sec_addr, sec_len, write_addr;
++  $display("[HYBRID] Preloading host ELF binary: %s", binary);
++  if (read_elf(binary)) $fatal(1, "[HYBRID] Failed to load ELF!");
++  while (get_section(sec_addr, sec_len)) begin
++    byte bf[] = new [sec_len];
++    if (read_section(sec_addr, bf, sec_len)) $fatal(1, "[HYBRID] Failed to read ELF section!");
++    if (sec_addr % 4 != 0 || sec_len % 4 != 0)
++      $fatal(1, "[HYBRID] Section addr/len not word-aligned");
++    if (sec_addr >= Sam[L2Spm0SamIdx].start_addr &&
++        sec_addr <  Sam[L2Spm0SamIdx+2*NumMemTiles-2].end_addr) begin
++      // L2-SPM data section: instant backdoor write.
++      $display("[HYBRID] L2-SPM (fastmode) section @ 0x%h (%0d bytes)", sec_addr, sec_len);
++      for (int i = 0; i < sec_len; i += 4) begin
++        write_addr = sec_addr + i;
++        fastmode_write_word(write_addr, {bf[i+3], bf[i+2], bf[i+1], bf[i]});
++      end
++    end else begin
++      // Cheshire-SPM (or other in-SoC) executable section: JTAG load (hart must
++      // already be halted by the caller).
++      $display("[HYBRID] Cheshire-SPM (JTAG) section @ 0x%h (%0d bytes)", sec_addr, sec_len);
++      fix.vip.jtag_load_section(sec_addr, bf, sec_len);
++    end
++  end
++  void'(get_entry(entry));
++  $display("[HYBRID] Host preload complete (entry 0x%h)", entry);
++endtask
++
++// Phase-2 PRINCIPLED DRAM host preload. The host ELF (dram_host.ld) places ALL
++// segments (.text/.misc/.bss/.arena) in external DRAM (0x80000000), which is now
++// a real backing store: the gwaihir LLC master port is backed by an axi_sim_mem
++// (i_llc_sim_mem) instead of an axi_err_slv. 0x80000000 is a CVA6 ExecuteRegion
++// + CachedRegion, so the CVA6 fetches+runs the host directly from DRAM. We
++// backdoor-write the ELF sections into the sim_mem byte array (instant), then the
++// caller resumes hart 0 at the ELF entry (0x80000000). The QCS shared region +
++// A/B/C live in the L2-SPM at runtime (carved by the cluster allocator); only the
++// firmware is preloaded there. The LLC config / hart halt is handled by the
++// caller (jtag_wait_for_llc_config_halt) exactly as the hybrid path.
++task automatic dram_host_elf_preload(input string binary, output cheshire_pkg::doub_bt entry);
++  longint sec_addr, sec_len;
++  $display("[DRAM] Preloading host ELF binary into axi_sim_mem: %s", binary);
++  if (read_elf(binary)) $fatal(1, "[DRAM] Failed to load ELF!");
++  while (get_section(sec_addr, sec_len)) begin
++    byte bf[] = new [sec_len];
++    if (read_section(sec_addr, bf, sec_len)) $fatal(1, "[DRAM] Failed to read ELF section!");
++    $display("[DRAM] sim_mem section @ 0x%h (%0d bytes)", sec_addr, sec_len);
++    // axi_sim_mem.mem is a byte-indexed associative array keyed by full address.
++    for (longint i = 0; i < sec_len; i++) begin
++      fix.dut.i_cheshire_tile.i_llc_sim_mem.mem[sec_addr + i] = bf[i];
++    end
++  end
++  void'(get_entry(entry));
++  $display("[DRAM] Host preload complete (entry 0x%h)", entry);
++endtask
++
+ // Suitable for loading ELFs with 32b-aligned sections
+ task automatic jtag_32b_elf_preload(input string binary, output bit [63:0] entry);
+   longint sec_addr, sec_len;
+diff --git a/target/sim/src/tb_gwaihir_top.sv b/target/sim/src/tb_gwaihir_top.sv
+index 1d9da46..4e167de 100644
+--- a/target/sim/src/tb_gwaihir_top.sv
++++ b/target/sim/src/tb_gwaihir_top.sv
+@@ -26,11 +26,12 @@ module tb_gwaihir_top;
+   string        preload_elf;
+   string        boot_hex;
+   logic  [ 1:0] boot_mode;
+-  logic  [ 1:0] preload_mode;
++  logic  [ 3:0] preload_mode;  // widened: PRELMODE=4 (DRAM) needs >2 bits
+   bit    [31:0] exit_code;
+   bit           snitch_preload;
+   string        snitch_elf;
+   logic  [63:0] snitch_entry;
++  logic  [63:0] chs_entry;
+   int           snitch_fn;
+   int           chs_fn;
+ 
+@@ -85,14 +86,39 @@ module tb_gwaihir_top;
+             $fatal(1, "Unsupported snitch binary preload mode %d (UART)!", preload_mode);
+           fix.vip.uart_debug_elf_run_and_wait(preload_elf, exit_code);
+         end
+-        3: begin  // Fast Mode
++        3: begin  // Fast Mode (Phase-2 HYBRID host placement)
+           jtag_enable_tiles();  // Write control registers
+           if (snitch_preload) fastmode_elf_preload(snitch_elf, snitch_entry);
+-          // TODO(fischeti): Implement fast mode for Cheshire binary
+-          fix.vip.jtag_elf_run(preload_elf);
++          // Phase-2 host blocker fix: the host ELF (hybrid.ld) splits into
++          //   .text @ 0x10000000 (Cheshire SPM: the ONLY CVA6-executable +
++          //                       coherent region big enough -- 128 KiB HW),
++          //   .misc/.bss @ 0x70014000 (L2-SPM: CVA6 load/store + cluster-shared).
++          // The L2-SPM aperture (0x70000000) is NOT a CVA6 ExecuteRegion, so
++          // fetching the host from there returns X (the original blocker).
++          // Backdoor the L2-SPM data, JTAG-load .text into the Cheshire SPM,
++          // then resume from the ELF entry (0x10000000).
++          fix.vip.jtag_init();
++          fix.vip.jtag_wait_for_llc_config_halt();  // wait LLC cfg + halt hart 0
++          hybrid_host_elf_preload(preload_elf, chs_entry);  // L2 fastmode + SPM JTAG
++          fix.vip.jtag_elf_run_no_preload(preload_elf);  // set PC=entry + resume
+           fix.vip.jtag_wait_for_eoc(exit_code);
+           if (snitch_preload) fastmode_read();
+         end
++        4: begin  // PRINCIPLED DRAM host placement (axi_sim_mem behind the LLC)
++          jtag_enable_tiles();  // Write control registers
++          if (snitch_preload) jtag_32b_elf_preload(snitch_elf, snitch_entry);  // DIAG: JTAG fw preload (isolate fastmode)
++          // The host ELF is linked entirely into external DRAM (0x80000000),
++          // which is now a real CVA6-executable+cached memory: the gwaihir LLC
++          // master port is backed by axi_sim_mem (i_llc_sim_mem), not an
++          // axi_err_slv. Backdoor the ELF into the sim_mem, then resume hart 0
++          // at the DRAM entry. No SPM crutch, no JTAG text load.
++          fix.vip.jtag_init();
++          fix.vip.jtag_wait_for_llc_config_halt();  // wait LLC cfg + halt hart 0
++          dram_host_elf_preload(preload_elf, chs_entry);  // sim_mem backdoor
++          fix.vip.jtag_elf_run_no_preload(preload_elf);   // set PC=entry + resume
++          fix.vip.jtag_wait_for_eoc(exit_code);
++          // if (snitch_preload) fastmode_read();  // DIAG: disabled (JTAG fw above)
++        end
+         default: begin
+           $fatal(1, "Unsupported preload mode %d (reserved)!", boot_mode);
+         end
+diff --git a/sw/cheshire/tests/qcs_gemm_seed.c b/sw/cheshire/tests/qcs_gemm_seed.c
+new file mode 100644
+index 0000000..a4848b0
+--- /dev/null
++++ b/sw/cheshire/tests/qcs_gemm_seed.c
+@@ -0,0 +1,332 @@
++// Copyright 2026 ETH Zurich and University of Bologna.
++// Licensed under the Apache License, Version 2.0, see LICENSE for details.
++// SPDX-License-Identifier: Apache-2.0
++//
++// Gate-(c) bring-up host: a LIGHT, SPM-resident Cheshire/CVA6 host that
++// hand-builds the EXACT QCS gemm job the slow DRAM IREE host
++// (cheshire/quidditch_gemm_main.c) would record, seeds it into L2-SPM, and wakes
++// cluster 0 so the qcs_replay firmware runs the real iree+xdsl gemm kernel.
++//
++// WHY (fast kernel-dispatch test): the full IREE-VM host is slow even on the 2x2
++// mini config (CVA6 boot + IREE VM/HAL recording dominate). This host skips the
++// VM entirely and emits the SAME single DISPATCH record the HAL command buffer
++// (cluster_command_buffer.c) emits for gemm64_dispatch_0, so it exercises
++// qcs_replay's DISPATCH path: the broadcast fan-out and the kernel's compute
++// half ($iree_to_xdsl) + DMA half ($dma) running in lockstep across cluster 0's
++// 8 compute + 1 DM cores. If the per-core internal-barrier counts diverge the
++// cluster wedges at PHASE=4 (RISK 1); if balanced the gemm completes + writes C.
++//
++// DISPATCH PARAMETERS (matched to the IREE host / kernel, cross-checked 3 ways):
++//   * gemm_square.mlir: @gemm64(tensor<16x16xf64>, tensor<16x16xf64>) ->
++//     tensor<16x16xf64>, linalg.matmul_transpose_b: C[i,j]=sum_k A[i,k]*B[j,k].
++//     3 tensor operands -> 3 bindings A,B,C; no push constants.
++//   * runtime/samples/gemm_square/harness.c (the proven direct driver mirroring
++//     executable.c): workgroup_count={1,1,1}, binding_count=3,
++//     binding_ptrs={A,B,C}, constant_count=attrs.constant_count(=0),
++//     constants=NULL, dynamic_local_memory=attrs.local_memory_pages*4096(=0).
++//   * gemm_square_kernel.o attrs: the only non-zero count is the binding count
++//     (=3); constant_count=0, local_memory_pages=0. Single export ordinal 0 with
++//     both an $iree_to_xdsl (compute) and a $dma half -> the firmware takes the
++//     broadcast (dma_fn != NULL) protocol.
++// The IREE HAL command buffer (cluster_command_buffer.c) forwards exactly these
++// to qcs_write_dispatch: executable_id=0, export_ordinal=0, the {1,1,1} grid, 0
++// constants, and the 3 bindings resolved to device-PAs of A,B,C. We reproduce
++// that record byte-for-byte.
++//
++// A/B fill + golden (pinned by the IREE host, quidditch_gemm_main.c):
++//   a[i]=i+1, b[i]=2*(i+1) (row-major 16x16 f64); matmul_transpose_b golden
++//   C[0]=2992, C[255]=1976752 (verified independently).
++//
++// Boot/wake: identical to simple_offload.c / qcs_offload_nojob.c -- seed every
++// cluster's scratch[1]=L2_SPM entry + scratch[0]=&return_code_array[i], zero the
++// return codes, wake cluster 0 (cl_clint_set). Clusters 1-3 hit the cluster-idx
++// guard and return; cluster 0 reads the descriptor, sees the valid job, and runs
++// qcs_replay_stream -> the gemm dispatch.
++
++#include <stdint.h>
++#include <string.h>
++
++#include "gw_addrmap.h"
++#include "gw_raw_addrmap.h"
++
++#include "snitch_cluster_cfg.h"
++
++// Cheshire UART (for the human-readable PASS/FAIL + C values in the cosim log).
++#include "regs/cheshire.h"
++#include "dif/clint.h"
++#include "dif/uart.h"
++#include "params.h"
++#include "util.h"
++
++//===----------------------------------------------------------------------===//
++// QCS ABI (vendored inline so this host stays single-file / dependency-light).
++// Field layout MUST match sw/snitch/apps/qcs_replay/src/cluster_command_stream.h.
++//===----------------------------------------------------------------------===//
++
++#define QCS_MAGIC 0x31534351u    // 'QCS1'
++#define QCS_VERSION 2u
++#define QCS_RECORD_ALIGN 8u
++#define QCS_JOB_DESCRIPTOR_OFFSET 0x10000u
++#define QCS_CMD_DISPATCH 1u
++
++typedef struct qcs_record_header_t {
++  uint32_t type;
++  uint32_t size;
++} qcs_record_header_t;
++
++typedef struct qcs_dispatch_t {
++  qcs_record_header_t header;
++  uint32_t executable_id;
++  uint32_t export_ordinal;
++  uint32_t flags;
++  uint32_t workgroup_count[3];
++  uint32_t workgroup_size[3];
++  uint32_t dynamic_local_memory;
++  uint64_t workgroup_count_ptr;
++  uint32_t constant_count;
++  uint32_t binding_count;
++} qcs_dispatch_t;
++
++typedef struct qcs_binding_t {
++  uint64_t device_ptr;  // device-physical = offset into the L2-SPM aperture
++  uint64_t length;
++} qcs_binding_t;
++
++typedef struct qcs_job_descriptor_t {
++  uint32_t magic;
++  uint32_t version;
++  uint32_t feature_flags;
++  uint32_t doorbell;
++  uint32_t completion;
++  int32_t status;
++  uint32_t record_count;
++  uint32_t reserved;
++  uint64_t executable_table_id;
++  uint64_t cmd_stream_ptr;
++  uint64_t cmd_stream_len;
++} qcs_job_descriptor_t;
++
++//===----------------------------------------------------------------------===//
++// L2-SPM layout (offsets into the GW_L2_SPM_BASE_ADDR(0) aperture).
++//===----------------------------------------------------------------------===//
++// region.base == GW_L2_SPM_BASE_ADDR(0) == 0x70000000; QCS device-PAs are byte
++// offsets into [0, GW_L2_SPM_TOTAL_SIZE). The firmware .text/.data live at the
++// region base (offset 0, ~50 KiB per the SLINK preload). Keep all of our
++// structures above 0x10000 (descriptor) and below the return_code_array page.
++#define L2_BASE         GW_L2_SPM_BASE_ADDR(0)
++#define OFF_DESC        QCS_JOB_DESCRIPTOR_OFFSET       // 0x10000 (fixed)
++// 0x10100 holds the firmware DEBUG block (QGDB phase markers); skip past it.
++#define OFF_STREAM      0x11000u                        // QCS command stream
++#define OFF_A           0x20000u                        // A 16x16 f64 (2048 B)
++#define OFF_B           0x21000u                        // B 16x16 f64
++#define OFF_C           0x22000u                        // C 16x16 f64
++
++#define N 16
++#define MAT_BYTES ((uint64_t)(N * N) * sizeof(double))  // 2048
++
++#define JOB_ID 0xC0FFEEu  // doorbell != 0
++
++// Return-code array in the last 4K page of the L2-SPM region (simple_offload).
++#define RETURN_CODE_ADDR \
++  (GW_L2_SPM_BASE_ADDR(0) + GW_L2_SPM_TOTAL_SIZE - 0x1000)
++volatile uint32_t (*return_code_array)[CFG_CLUSTER_NR_CORES] =
++    (uint32_t (*)[CFG_CLUSTER_NR_CORES])RETURN_CODE_ADDR;
++
++// Firmware DEBUG block (sw/snitch/apps/qcs_replay/src/qcs_replay.c): the last
++// PHASE the cluster reached. Lets us diagnose a wedge from the host side.
++#define OFF_DBG     0x10100u
++#define DBG_MAGIC   0x51474442ull  // "QGDB"
++
++static volatile uint8_t* l2_ptr(uint32_t off) {
++  return (volatile uint8_t*)(uintptr_t)(L2_BASE + off);
++}
++
++//===----------------------------------------------------------------------===//
++// Tiny UART helpers (no printf dependency; integer + hex only).
++//===----------------------------------------------------------------------===//
++static void u_str(const char* s) {
++  uart_write_str(&__uart_base_addr__, (void*)s, strlen(s));
++}
++static void u_dec(uint64_t v) {
++  char buf[24];
++  int i = 24;
++  buf[--i] = '\0';
++  if (v == 0) buf[--i] = '0';
++  while (v && i > 0) { buf[--i] = (char)('0' + (v % 10)); v /= 10; }
++  u_str(&buf[i]);
++}
++static void u_hex64(uint64_t v) {
++  char buf[19];
++  int i = 18;
++  buf[--i] = '\0';
++  for (int n = 0; n < 16; ++n) {
++    uint32_t nib = (uint32_t)(v & 0xf);
++    buf[--i] = (char)(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
++    v >>= 4;
++  }
++  u_str("0x");
++  u_str(&buf[i]);
++}
++
++int main(void) {
++  // --- Bring up the UART (helloworld.c pattern). ---
++  uint32_t rtc_freq = CHS_REGS->rtc_freq.f.ref_freq;  // util.h provides CHS_REGS
++  uint64_t reset_freq = clint_get_core_freq(rtc_freq, 2500);
++  uart_init(&__uart_base_addr__, reset_freq, __BOOT_BAUDRATE);
++  u_str("\r\n[seed] === gate (c): hand-built QCS gemm -> cluster dispatch ===\r\n");
++
++  // --- 1. Lay out + fill A, B, C in L2-SPM. ---
++  // A[i]=i+1, B[i]=2*(i+1) (f64, row-major 16x16); zero C. The CVA6 stores f64
++  // directly into the L2-SPM aperture the cluster iDMA reads.
++  volatile double* A = (volatile double*)l2_ptr(OFF_A);
++  volatile double* B = (volatile double*)l2_ptr(OFF_B);
++  volatile double* C = (volatile double*)l2_ptr(OFF_C);
++  for (int i = 0; i < N * N; ++i) {
++    A[i] = (double)(i + 1);
++    B[i] = (double)(2 * (i + 1));
++    C[i] = 0.0;
++  }
++
++  // --- 2. Build the QCS command stream (one DISPATCH record). ---
++  // Match cluster_command_buffer.c's emission for gemm64_dispatch_0 exactly:
++  // executable_id=0, export_ordinal=0, flags=0 (direct), workgroup_count={1,1,1},
++  // workgroup_size={1,1,1} (the firmware/kernel ignore it), 0 constants, 3
++  // bindings (A,B,C) as device-PAs (= aperture offsets). constant_count=0 so the
++  // bindings start right after the qcs_dispatch_t header (8-aligned already).
++  volatile qcs_dispatch_t* d = (volatile qcs_dispatch_t*)l2_ptr(OFF_STREAM);
++  // Bindings immediately follow the (already 8-aligned) qcs_dispatch_t.
++  uint32_t bindings_off = (uint32_t)sizeof(qcs_dispatch_t);  // constant_count==0
++  uint32_t stream_len =
++      bindings_off + 3u * (uint32_t)sizeof(qcs_binding_t);
++  // round up to QCS_RECORD_ALIGN
++  stream_len = (stream_len + (QCS_RECORD_ALIGN - 1)) & ~(QCS_RECORD_ALIGN - 1);
++
++  // Zero the record first (the firmware reader validates the padded size).
++  for (uint32_t b = 0; b < stream_len; ++b) ((volatile uint8_t*)d)[b] = 0;
++
++  d->header.type = QCS_CMD_DISPATCH;
++  d->header.size = stream_len;
++  d->executable_id = 0u;
++  d->export_ordinal = 0u;
++  d->flags = 0u;
++  d->workgroup_count[0] = 1u;
++  d->workgroup_count[1] = 1u;
++  d->workgroup_count[2] = 1u;
++  d->workgroup_size[0] = 1u;
++  d->workgroup_size[1] = 1u;
++  d->workgroup_size[2] = 1u;
++  d->dynamic_local_memory = 0u;
++  d->workgroup_count_ptr = 0u;
++  d->constant_count = 0u;
++  d->binding_count = 3u;
++
++  volatile qcs_binding_t* binds =
++      (volatile qcs_binding_t*)((volatile uint8_t*)d + bindings_off);
++  binds[0].device_ptr = OFF_A; binds[0].length = MAT_BYTES;  // A
++  binds[1].device_ptr = OFF_B; binds[1].length = MAT_BYTES;  // B
++  binds[2].device_ptr = OFF_C; binds[2].length = MAT_BYTES;  // C
++
++  // --- 3. Publish the job descriptor at the fixed offset. ---
++  // Zero a full page first so any firmware slack reads back defined (avoids the
++  // X-propagation RegWriteKnown wedge that bit the no-job bring-up).
++  volatile uint32_t* descpage = (volatile uint32_t*)l2_ptr(OFF_DESC);
++  for (uint32_t w = 0; w < 0x1000u / sizeof(uint32_t); ++w) descpage[w] = 0u;
++
++  volatile qcs_job_descriptor_t* job =
++      (volatile qcs_job_descriptor_t*)l2_ptr(OFF_DESC);
++  job->magic = QCS_MAGIC;
++  job->version = QCS_VERSION;
++  job->feature_flags = 0u;
++  job->completion = 0u;
++  job->status = 0;
++  job->record_count = 1u;
++  job->reserved = 0u;
++  job->executable_table_id = 0u;  // host compiled against executable table 0
++  job->cmd_stream_ptr = OFF_STREAM;
++  job->cmd_stream_len = stream_len;
++  // doorbell LAST (after the rest of the descriptor + stream are written), so the
++  // cluster never observes a half-built job.
++  __asm__ volatile("fence" ::: "memory");
++  job->doorbell = JOB_ID;
++  __asm__ volatile("fence" ::: "memory");
++
++  u_str("[seed] QCS job published: stream@");
++  u_hex64(OFF_STREAM); u_str(" len="); u_dec(stream_len);
++  u_str(" bindings A="); u_hex64(L2_BASE + OFF_A);
++  u_str(" B="); u_hex64(L2_BASE + OFF_B);
++  u_str(" C="); u_hex64(L2_BASE + OFF_C);
++  u_str("\r\n");
++
++  // --- 4. Boot/wake (identical to simple_offload.c). ---
++  for (int i = 0; i < SNRT_CLUSTER_NUM; i++) {
++    *(volatile uint64_t *)&(gwaihir_addrmap.cluster[i].peripheral_reg.scratch[1].w) =
++        (uintptr_t)&gwaihir_addrmap.l2_spm;
++    *(volatile uint64_t *)&(gwaihir_addrmap.cluster[i].peripheral_reg.scratch[0].w) =
++        (uintptr_t)&return_code_array[i];
++    for (int j = 0; j < CFG_CLUSTER_NR_CORES; j++) {
++      return_code_array[i][j] = 0;
++    }
++  }
++  __asm__ volatile("fence" ::: "memory");
++
++  u_str("[seed] waking cluster 0 ...\r\n");
++  // Start all cores in cluster 0, which wakes the other clusters (world barrier).
++  *(volatile uint64_t *)&(gwaihir_addrmap.cluster[0].peripheral_reg.cl_clint_set.w) =
++      (1 << CFG_CLUSTER_NR_CORES) - 1;
++
++  // --- 5. Wait until all cores of all clusters report done (simple_offload). ---
++  int all_finished = 0;
++  while (!all_finished) {
++    all_finished = 1;
++    for (int i = 0; i < SNRT_CLUSTER_NUM; i++) {
++      for (int j = 0; j < CFG_CLUSTER_NR_CORES; j++) {
++        if ((return_code_array[i][j] & 1) == 0) {
++          all_finished = 0;
++          break;
++        }
++      }
++    }
++  }
++
++  // Sum the snitch return codes (rc<<1 | 1 per core); non-zero => a core failed.
++  uint32_t rc_sum = 0;
++  for (int i = 0; i < SNRT_CLUSTER_NUM; i++)
++    for (int j = 0; j < CFG_CLUSTER_NR_CORES; j++)
++      rc_sum += (return_code_array[i][j] >> 1);
++
++  // --- 6. Read back the descriptor completion + C, verify the golden. ---
++  __asm__ volatile("fence" ::: "memory");
++  volatile uint64_t* dbg = (volatile uint64_t*)l2_ptr(OFF_DBG);
++  u_str("[seed] cluster done: rc_sum="); u_dec(rc_sum);
++  u_str(" desc.status="); u_dec((uint64_t)(uint32_t)job->status);
++  u_str(" desc.completion="); u_hex64(job->completion);
++  u_str(" dbg.phase=");
++  u_dec(dbg[0] == DBG_MAGIC ? dbg[1] : (uint64_t)-1);
++  u_str("\r\n");
++
++  // Read C[0] and C[255] as integers (the golden is exact-representable in f64).
++  double c0 = C[0];
++  double c255 = C[N * N - 1];
++  uint64_t c0_i = (uint64_t)(int64_t)c0;
++  uint64_t c255_i = (uint64_t)(int64_t)c255;
++  u_str("[seed] C[0]="); u_dec(c0_i);
++  u_str(" C[255]="); u_dec(c255_i);
++  u_str(" (expected 2992 / 1976752)\r\n");
++
++  int pass = (c0_i == 2992u) && (c255_i == 1976752u) && (rc_sum == 0u) &&
++             (job->status == 0) && (job->completion == JOB_ID);
++  if (pass) {
++    u_str("[seed] *** PASS: cluster ran gemm64 dispatch, C == A @ B ***\r\n");
++  } else {
++    u_str("[seed] *** FAIL ***");
++    if (c0_i != 2992u || c255_i != 1976752u) u_str(" [numerics]");
++    if (rc_sum != 0u) u_str(" [core-rc]");
++    if (job->status != 0) u_str(" [desc.status]");
++    if (job->completion != JOB_ID) u_str(" [no-completion]");
++    u_str("\r\n");
++  }
++  uart_write_flush(&__uart_base_addr__);
++
++  // Host return code: 0 on PASS (scratch[2]/SLINK), non-zero otherwise.
++  return pass ? 0 : (rc_sum ? (int)rc_sum : 30);
++}
+diff --git a/sw/cheshire/tests/qcs_offload_nojob.c b/sw/cheshire/tests/qcs_offload_nojob.c
+new file mode 100644
+index 0000000..1cafe41
+--- /dev/null
++++ b/sw/cheshire/tests/qcs_offload_nojob.c
+@@ -0,0 +1,95 @@
++// Copyright 2026 ETH Zurich and University of Bologna.
++// Licensed under the Apache License, Version 2.0, see LICENSE for details.
++// SPDX-License-Identifier: Apache-2.0
++//
++// Gate-(b) bring-up host for the QCS replayer (no-job smoke test).
++//
++// This is a minimal variant of simple_offload.c (the proven offload oracle).
++// It performs the SAME boot/wake protocol -- seed every cluster's boot scratch
++// regs (entry point + return_code_array slot), wake cluster 0, then poll the
++// return_code_array until all cores of all clusters report done -- and ADDS one
++// step: it zeroes the QCS job-descriptor page in L2 SPM before waking.
++//
++// WHY: in the real flow the host writes a valid qcs_job_descriptor_t into L2 SPM
++// before the doorbell, so that region is initialized. In this no-job smoke test
++// nothing writes the descriptor, and uninitialized L2 SPM reads back as X in
++// RTL sim. Cluster 0's cores load job->magic at L2_SPM_BASE+0x10000, get X, and
++// the X propagates into a register write -> the snitch RegWriteKnown assertion
++// fires on every cluster-0 core (the prior gate-(b) wedge). Zeroing the
++// descriptor page makes job->magic == 0 != QCS_MAGIC, so the cluster firmware's
++// no-job guard returns 0 cleanly (rc 0) exactly like simple.elf.
++//
++// We deliberately do NOT modify simple_offload.c (the oracle); this is a
++// separate, equally byte-aligned host.
++
++#include <stdint.h>
++#include "gw_addrmap.h"
++#include "gw_raw_addrmap.h"
++
++#include "snitch_cluster_cfg.h"
++
++// Return code array placed at the last 4K page of the L2 SPM region.
++// This address scales automatically with the number and size of memory tiles.
++#define RETURN_CODE_ADDR \
++  (GW_L2_SPM_BASE_ADDR(0) + GW_L2_SPM_TOTAL_SIZE - 0x1000)
++
++// QCS job descriptor page: the cluster firmware reads the descriptor at this
++// fixed offset into the L2-SPM aperture (QCS_JOB_DESCRIPTOR_OFFSET == 0x10000,
++// see sw/snitch/apps/qcs_replay/src/cluster_command_stream.h). The descriptor
++// struct (qcs_job_descriptor_t) is 56 bytes; we zero a full 4K page so the
++// whole descriptor + any slack the firmware might touch reads back as 0.
++#define QCS_JOB_DESCRIPTOR_OFFSET 0x10000u
++#define QCS_DESCRIPTOR_ADDR (GW_L2_SPM_BASE_ADDR(0) + QCS_JOB_DESCRIPTOR_OFFSET)
++#define QCS_DESCRIPTOR_ZERO_BYTES 0x1000u  // one page, >> sizeof(descriptor)
++
++// This needs to be in a region which is not cached
++volatile uint32_t (*return_code_array)[CFG_CLUSTER_NR_CORES] = (uint32_t (*)[CFG_CLUSTER_NR_CORES])RETURN_CODE_ADDR;
++
++int main() {
++
++  // Zero the QCS job-descriptor page BEFORE waking the cluster, so the cluster
++  // firmware reads a defined (all-zero) descriptor: magic 0 != QCS_MAGIC ->
++  // no-job guard -> clean return. Word-wise to keep it simple and aligned.
++  volatile uint32_t *desc = (volatile uint32_t *)QCS_DESCRIPTOR_ADDR;
++  for (uint32_t off = 0; off < QCS_DESCRIPTOR_ZERO_BYTES / sizeof(uint32_t); off++) {
++    desc[off] = 0u;
++  }
++
++  // Write entry point to scratch register 1
++  // and return code address to scratch register 0
++  // Initalize return address loaction before offloading.
++  for (int i = 0; i < SNRT_CLUSTER_NUM; i++) {
++    *(volatile uint64_t *)&(gwaihir_addrmap.cluster[i].peripheral_reg.scratch[1].w) = (uintptr_t)&gwaihir_addrmap.l2_spm;
++    *(volatile uint64_t *)&(gwaihir_addrmap.cluster[i].peripheral_reg.scratch[0].w) = (uintptr_t)&return_code_array[i];
++    for (int j = 0; j < CFG_CLUSTER_NR_CORES; j++) {
++      return_code_array[i][j] = 0;
++    }
++  }
++
++  // Start all cores in Cluster 0, which will wake up all other clusters
++  *(volatile uint64_t *)&(gwaihir_addrmap.cluster[0].peripheral_reg.cl_clint_set.w) = (1 << CFG_CLUSTER_NR_CORES) - 1;
++
++  // Wait until all cores have finished
++  int all_finished = 0;
++  while (!all_finished) {
++    all_finished = 1;
++    for (int i = 0; i < SNRT_CLUSTER_NUM; i++) {
++      for (int j = 0; j < CFG_CLUSTER_NR_CORES; j++) {
++        if ((return_code_array[i][j] & 1) == 0) {
++          all_finished = 0;
++          break;
++        }
++      }
++    }
++  }
++
++  // Sum up the return codes
++  uint32_t sum = 0;
++  for (int i = 0; i < SNRT_CLUSTER_NUM; i++) {
++    for (int j = 0; j < CFG_CLUSTER_NR_CORES; j++) {
++      sum += (return_code_array[i][j] >> 1);
++    }
++  }
++
++  return sum;
++}

@@ -38,10 +38,25 @@ build rather than drifting silently.
 
 ## Building (gwaihir)
 
+Nimbus does not vendor the gwaihir SoC tree; it wires its firmware into an external
+`pulp-platform/gwaihir` checkout pinned at `4eac10a` + the co-sim patches in
+`targets/gwaihir/patches/` (gwaihir's own HW deps — cheshire/cva6/snitch_cluster —
+come from its `Bender.lock`). Full patch details in `targets/gwaihir/patches/README.md`.
+
 ```
 git clone --recurse-submodules git@github.com:DanielKellerM/nimbus.git
 cd nimbus
-# Wire the QCS-replayer firmware into a checked-out gwaihir tree, then build the app.
+
+# 1. Prepare the gwaihir tree: upstream base + the co-sim patch + HW deps.
+git clone https://github.com/pulp-platform/gwaihir.git <gwaihir-tree>
+git -C <gwaihir-tree> checkout 4eac10a
+git -C <gwaihir-tree> apply "$PWD/targets/gwaihir/patches/gwaihir-cosim.patch"
+( cd <gwaihir-tree> && bender checkout )
+
+# 2. (rv64 host build only) skip the slow flatcc verify in the IREE submodule.
+git -C quidditch/iree apply "$PWD/targets/gwaihir/patches/iree-verify-off.patch"
+
+# 3. Wire the QCS-replayer firmware into the gwaihir tree and build the app.
 QUIDDITCH_GWAIHIR_GEN=<gwaihir-tree> \
   targets/gwaihir/firmware/gwaihir/link_into_gwaihir_tree.sh
 make -C <gwaihir-tree> sw            # builds sw/snitch/apps/qcs_replay/build/qcs_replay.elf
