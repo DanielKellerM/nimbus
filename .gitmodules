@@ -1,5 +1,5 @@
 [submodule "quidditch"]
 	path = quidditch
 	url = git@github.com:DanielKellerM/Quidditch.git
-	branch = nimbus-base-v0
+	branch = main
 	shallow = true
