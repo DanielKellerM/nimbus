@@ -38,10 +38,11 @@ build rather than drifting silently.
 
 ## Building (gwaihir)
 
-Nimbus does not vendor the gwaihir SoC tree; it wires its firmware into an external
-`pulp-platform/gwaihir` checkout pinned at `4eac10a` + the co-sim patches in
-`targets/gwaihir/patches/` (gwaihir's own HW deps — cheshire/cva6/snitch_cluster —
-come from its `Bender.lock`). Full patch details in `targets/gwaihir/patches/README.md`.
+Nimbus does not vendor the gwaihir SoC tree; it pins it by reference and wires its
+firmware into an external checkout. The pin — gwaihir SHA, the co-sim patch, and the
+exact bender HW-dep lock — is recorded in `targets/gwaihir/GWAIHIR_PIN.md`
+(`gwaihir-4eac10a.Bender.lock` is the vendored `Bender.lock`). Patch details in
+`targets/gwaihir/patches/README.md`.
 
 ```
 git clone --recurse-submodules git@github.com:DanielKellerM/nimbus.git
@@ -51,6 +52,7 @@ cd nimbus
 git clone https://github.com/pulp-platform/gwaihir.git <gwaihir-tree>
 git -C <gwaihir-tree> checkout 4eac10a
 git -C <gwaihir-tree> apply "$PWD/targets/gwaihir/patches/gwaihir-cosim.patch"
+cmp <gwaihir-tree>/Bender.lock targets/gwaihir/gwaihir-4eac10a.Bender.lock  # verify HW-dep pin
 ( cd <gwaihir-tree> && bender checkout )
 
 # 2. (rv64 host build only) skip the slow flatcc verify in the IREE submodule.
