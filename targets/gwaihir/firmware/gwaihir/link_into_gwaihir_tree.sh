@@ -6,8 +6,9 @@
 # Wire the QCS-replayer firmware into a gwaihir snitch-app dir so the RTL build
 # compiles the repo's VERSIONED source of truth -- not a hand-maintained copy.
 #
-# The canonical sources live here (runtime/host/firmware/gwaihir/) and in
-# runtime/host/transport/. This script (re-)creates
+# The canonical sources live here (targets/gwaihir/firmware/gwaihir/) and in
+# targets/gwaihir/transport/; the shared executable-ABI header comes from the
+# quidditch submodule. This script (re-)creates
 #   <gwaihir>/sw/snitch/apps/qcs_replay/{src/*, app.mk}
 # as symlinks back to them, so an edit in the repo is what the sim builds. Pure
 # generated artifacts (lib/ = the SPLIT iree+xdsl kernel .o/.a, build/) are left
@@ -24,12 +25,13 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-repo=$(cd "$here/../../../.." && pwd)
-fw_dir="$here"                                   # firmware sources (this dir)
-tp_dir="$repo/runtime/host/transport"            # QCS ABI + reader (canonical)
-rt_dir="$repo/runtime/runtime/src/Quidditch"     # shared executable-ABI header
+nimbus_root="${NIMBUS_ROOT:-$(cd "$here/../../../.." && pwd)}"
+quidditch_root="${QUIDDITCH_ROOT:-$nimbus_root/quidditch}"
+fw_dir="$here"                                            # firmware sources (this dir)
+tp_dir="$nimbus_root/targets/gwaihir/transport"          # QCS ABI + reader (canonical)
+rt_dir="$quidditch_root/runtime/runtime/src/Quidditch"   # shared executable-ABI header (submodule)
 
-gw="${1:-${QUIDDITCH_GWAIHIR_GEN:-$repo/.gwaihir}}"
+gw="${1:-${QUIDDITCH_GWAIHIR_GEN:-$nimbus_root/.gwaihir}}"
 mode="${LINK_MODE:-symlink}"
 
 [ -d "$gw/sw/snitch/apps" ] || {
