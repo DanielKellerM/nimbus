@@ -50,9 +50,11 @@ make -C <gwaihir-tree> sw            # builds sw/snitch/apps/qcs_replay/build/qc
 The firmware sources (Nimbus) and the executable-ABI header (the `quidditch`
 submodule) are wired through two roots — `NIMBUS_ROOT` and
 `QUIDDITCH_ROOT=$NIMBUS_ROOT/quidditch` — both env-overridable in the link script.
-`qcs_replay.elf` built this way is byte-identical to the pre-split Quidditch build;
-that equality is the split's regression oracle. The full CVA6-host → cluster co-sim
-run is in `docs/nimbus-design.md`.
+At split time `qcs_replay.elf` built this way was verified byte-identical to the
+pre-split Quidditch build (`sha256sum .../qcs_replay.elf` →
+`40d65e8235e1b0a19ec41b01fae4167297bf8475bc209b85634c5c682fac72b4` for the checked-in
+gwaihir config), confirming the move changed no bytes. The full CVA6-host → cluster
+co-sim run is in `docs/nimbus-design.md`.
 
 A new SoC is a new `targets/<soc>/` + placement config + linker script +
 `firmware/<soc>/` — not a rewrite.
