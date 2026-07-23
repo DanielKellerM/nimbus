@@ -1,0 +1,8 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.vmfb
+runs/
+# Machine-specific SoC tree symlink (per-machine; set locally)
+.gwaihir
