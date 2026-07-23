@@ -1,3 +1,3 @@
 [submodule "quidditch"]
 	path = quidditch
-	url = /home/dankeller/Projects/Quidditch
+	url = git@github.com:DanielKellerM/Quidditch.git
