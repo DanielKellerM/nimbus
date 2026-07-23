@@ -51,10 +51,11 @@ The firmware sources (Nimbus) and the executable-ABI header (the `quidditch`
 submodule) are wired through two roots — `NIMBUS_ROOT` and
 `QUIDDITCH_ROOT=$NIMBUS_ROOT/quidditch` — both env-overridable in the link script.
 At split time `qcs_replay.elf` built this way was verified byte-identical to the
-pre-split Quidditch build, confirming the move changed no bytes. The recorded
-`sha256sum` was `40d65e8…5c682fac72b4` (MANUAL snapshot, default gwaihir cfg —
-recompute with `sha256sum` if the kernel or cfg changes). The full CVA6-host →
-cluster co-sim run is in `docs/nimbus-design.md`.
+pre-split Quidditch build, confirming the move changed no bytes. Recorded `sha256sum`
+(MANUAL snapshot for the default gwaihir cfg; owner: repo maintainer — recompute if
+the kernel or cfg changes):
+`40d65e8235e1b0a19ec41b01fae4167297bf8475bc209b85634c5c682fac72b4`. The full
+CVA6-host → cluster co-sim run is in `docs/nimbus-design.md`.
 
 A new SoC is a new `targets/<soc>/` + placement config + linker script +
 `firmware/<soc>/` — not a rewrite.
