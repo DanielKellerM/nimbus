@@ -18,12 +18,22 @@ depends on Nimbus.
 ## Layout
 
 ```
-quidditch/          git submodule — the compiler, device runtime, and interface-v0 ABI headers
-targets/gwaihir/    the gwaihir/cheshire/CVA6 deployment: cheshire host, cluster HAL,
-                    transport (QCS + shared region), firmware (QCS replayer), patches
-sim/                co-sim helpers (the gwaihir cluster-sim builder)
-docs/               design + bring-up docs
+quidditch/            git submodule — the compiler, device runtime, and interface-v0 ABI headers
+targets/gwaihir/      the gwaihir deployment:
+  soc/                git submodule — pulp-platform/gwaihir @ 4eac10a (the SoC tree)
+  patches/            co-sim mods applied on top of the pinned soc/ (+ the IREE verify-off patch)
+  {cheshire,hal,       cheshire host, cluster HAL, transport (QCS + shared region),
+   transport,firmware} firmware (QCS replayer) — wired into soc/ by setup-gwaihir.sh
+  setup-gwaihir.sh    one-command prep: reset soc/ → apply patch → bender checkout → wire firmware
+sim/                  co-sim helpers (the gwaihir cluster-sim builder)
+docs/                 design + bring-up docs
 ```
+
+Both external deps are **git submodules** (`.gitmodules`), so `git submodule
+update --init` pins and fetches them — no manual clone. gwaihir is *not* declared via a
+nimbus-root `Bender.yml`: gwaihir is itself a top-level bender project whose own build
+resolves its HW deps (cheshire/cva6/snitch_cluster) from *its* `Bender.lock`; the submodule
+pins **which** gwaihir, and `setup-gwaihir.sh` runs gwaihir's own `bender checkout`.
 
 ## The seam
 
@@ -38,30 +48,20 @@ build rather than drifting silently.
 
 ## Building (gwaihir)
 
-Nimbus does not vendor the gwaihir SoC tree; it pins it by reference and wires its
-firmware into an external checkout. The pin — gwaihir SHA, the co-sim patch, and the
-exact bender HW-dep lock — is recorded in `targets/gwaihir/GWAIHIR_PIN.md`
-(`gwaihir-4eac10a.Bender.lock` is the vendored `Bender.lock`). Patch details in
-`targets/gwaihir/patches/README.md`.
+gwaihir is a pinned submodule (`targets/gwaihir/soc` @ `4eac10a`); the co-sim mods
+ride on top as `patches/gwaihir-cosim.patch`. `setup-gwaihir.sh` applies the patch,
+runs bender, and wires the firmware in one idempotent command. The pinned dep tree is
+recorded in `targets/gwaihir/GWAIHIR_PIN.md`; patch details in `patches/README.md`.
 
 ```
-git clone --recurse-submodules git@github.com:DanielKellerM/nimbus.git
-cd nimbus
+git clone git@github.com:DanielKellerM/nimbus.git && cd nimbus
+git submodule update --init --recursive          # fetches quidditch + gwaihir (soc/) at their pins
 
-# 1. Prepare the gwaihir tree: upstream base + the co-sim patch + HW deps.
-git clone https://github.com/pulp-platform/gwaihir.git <gwaihir-tree>
-git -C <gwaihir-tree> checkout 4eac10a
-git -C <gwaihir-tree> apply "$PWD/targets/gwaihir/patches/gwaihir-cosim.patch"
-cmp <gwaihir-tree>/Bender.lock targets/gwaihir/gwaihir-4eac10a.Bender.lock  # verify HW-dep pin
-( cd <gwaihir-tree> && bender checkout )
-
-# 2. (rv64 host build only) skip the slow flatcc verify in the IREE submodule.
+# rv64 host build only: skip the slow flatcc verify in the IREE submodule.
 git -C quidditch/iree apply "$PWD/targets/gwaihir/patches/iree-verify-off.patch"
 
-# 3. Wire the QCS-replayer firmware into the gwaihir tree and build the app.
-QUIDDITCH_GWAIHIR_GEN=<gwaihir-tree> \
-  targets/gwaihir/firmware/gwaihir/link_into_gwaihir_tree.sh
-make -C <gwaihir-tree> sw            # builds sw/snitch/apps/qcs_replay/build/qcs_replay.elf
+targets/gwaihir/setup-gwaihir.sh                 # patch soc/ + bender checkout + wire firmware
+make -C targets/gwaihir/soc sw                   # -> sw/snitch/apps/qcs_replay/build/qcs_replay.elf
 ```
 
 The firmware sources (Nimbus) and the executable-ABI header (the `quidditch`

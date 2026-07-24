@@ -3,3 +3,6 @@
 	url = git@github.com:DanielKellerM/Quidditch.git
 	branch = main
 	shallow = true
+[submodule "targets/gwaihir/soc"]
+	path = targets/gwaihir/soc
+	url = https://github.com/pulp-platform/gwaihir.git
