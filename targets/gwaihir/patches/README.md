@@ -3,24 +3,24 @@
 Two patch targets, applied to *external* trees the build wires into (neither is
 committed back into its submodule):
 
-## `gwaihir-cosim.patch` → the gwaihir tree
-Base: **`pulp-platform/gwaihir` @ `4eac10a`** (on `origin/main`). Carries the
-co-sim bring-up mods on top of upstream: the 2×2/mini NoC cfg
+## `gwaihir-cosim.patch` → the `soc/` submodule
+Applies on the pinned gwaihir submodule (`targets/gwaihir/soc` @ `4eac10a`). Carries
+the co-sim bring-up mods on top of upstream: the 2×2/mini NoC cfg
 (`cfg/mini_gwaihir_noc.yml`), the SoC/tile/pkg RTL (`hw/cheshire_tile.sv`,
 `hw/cluster_tile.sv`, `hw/gwaihir_pkg.sv`, `hw/gwaihir_top.sv`), the phase-2
 testbench (`target/sim/{src/tb_gwaihir_top.sv,include/tb_gwaihir_tasks.svh}`), the
 snitch start shim, `sw/sw.mk`, and the cheshire seed/offload test hosts. HW deps
-(cheshire/cva6/snitch_cluster) come from the tree's committed `Bender.lock` via
-`bender checkout`, not this patch.
+(cheshire/cva6/snitch_cluster) come from `soc/Bender.lock` via `bender checkout`, not
+this patch.
 
-Apply from the gwaihir tree root:
+Normally you don't apply this by hand — `../setup-gwaihir.sh` does it. Manually:
 ```
-git clone https://github.com/pulp-platform/gwaihir.git && cd gwaihir
-git checkout 4eac10a
-git apply <nimbus>/targets/gwaihir/patches/gwaihir-cosim.patch
-bender checkout                                   # cheshire/cva6/snitch_cluster per Bender.lock
+git submodule update --init targets/gwaihir/soc
+git -C targets/gwaihir/soc apply targets/gwaihir/patches/gwaihir-cosim.patch
+( cd targets/gwaihir/soc && bender checkout )
 ```
-Verified: applies clean to a fresh `4eac10a` checkout.
+Verified: applies clean to the pinned `soc/` @ `4eac10a` and reconstructs the co-sim
+tree byte-identically.
 
 ## `iree-verify-off.patch` → the IREE tree (Quidditch submodule)
 Guards the flatcc `iree_vm_BytecodeModuleDef_verify_as_root` call in

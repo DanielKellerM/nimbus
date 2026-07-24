@@ -1,13 +1,13 @@
 # gwaihir pin
 
-Nimbus does not vendor the gwaihir SoC tree; it pins it by reference. This file is
-the machine-readable record of that pin.
+gwaihir is pinned as a git submodule — `targets/gwaihir/soc` — so the pin is
+machine-enforced by `.gitmodules` + the recorded gitlink, not prose.
 
 | What | Pin |
 |---|---|
-| gwaihir | `pulp-platform/gwaihir` @ `4eac10a36a0ff6868b4b5c2ae3dc51de7b90d8ba` (`origin/main`) |
-| co-sim mods | `patches/gwaihir-cosim.patch` (applies clean on `4eac10a`) |
-| HW deps (bender) | `gwaihir-4eac10a.Bender.lock` — the exact `Bender.lock` from gwaihir@`4eac10a`, 34 packages |
+| gwaihir | `targets/gwaihir/soc` @ `4eac10a36a0ff6868b4b5c2ae3dc51de7b90d8ba` (`pulp-platform/gwaihir`) |
+| co-sim mods | `patches/gwaihir-cosim.patch`, applied by `setup-gwaihir.sh` (verified: applies clean on the pin) |
+| HW deps (bender) | `soc/Bender.lock` (34 packages) — gwaihir's own lock; `bender checkout` resolves it |
 
 Top-level HW deps the lock resolves:
 
@@ -17,14 +17,8 @@ Top-level HW deps the lock resolves:
 | cva6 | `737c5837830d88dbe9a9493633ed8a01e6e681bd` |
 | snitch_cluster | `06426b0632814cd0acdba5e0eef3dd342bf42c71` |
 
-The co-sim patch does **not** modify bender, so `bender checkout` in a gwaihir tree
-at `4eac10a` reproduces exactly these deps. Verify the tree you build against matches
-this pin:
+The co-sim patch does **not** modify bender, so `bender checkout` on the pinned
+`soc/` reproduces exactly these deps.
 
-```
-git -C <gwaihir-tree> rev-parse HEAD            # == 4eac10a...
-cmp <gwaihir-tree>/Bender.lock targets/gwaihir/gwaihir-4eac10a.Bender.lock
-```
-
-To bump gwaihir: re-checkout the new SHA, re-generate `gwaihir-cosim.patch`, refresh
-`gwaihir-4eac10a.Bender.lock` (rename to the new SHA), and update this table.
+To bump gwaihir: check out the new SHA in `soc/`, re-generate `gwaihir-cosim.patch`
+against it, commit the submodule gitlink, and update this table.
