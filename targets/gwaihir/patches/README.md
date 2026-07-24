@@ -13,10 +13,11 @@ snitch start shim, `sw/sw.mk`, and the cheshire seed/offload test hosts. HW deps
 (cheshire/cva6/snitch_cluster) come from `soc/Bender.lock` via `bender checkout`, not
 this patch.
 
-Normally you don't apply this by hand — `../setup-gwaihir.sh` does it. Manually:
+Normally you don't apply this by hand — `../setup-gwaihir.sh` does it. Manually (from
+the nimbus root; the patch path must be absolute since `git -C` changes directory):
 ```
 git submodule update --init targets/gwaihir/soc
-git -C targets/gwaihir/soc apply targets/gwaihir/patches/gwaihir-cosim.patch
+git -C targets/gwaihir/soc apply "$PWD/targets/gwaihir/patches/gwaihir-cosim.patch"
 ( cd targets/gwaihir/soc && bender checkout )
 ```
 Verified: applies clean to the pinned `soc/` @ `4eac10a` and reconstructs the co-sim
