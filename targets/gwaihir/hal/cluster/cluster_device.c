@@ -16,6 +16,10 @@
 #include "runtime/host/transport/cluster_command_stream.h"
 #include "runtime/host/transport/shared_region.h"
 
+#ifdef QCS_DUMP_GOLDEN
+#include "hostio.h"  // Phase-0 golden dump only: UART host_puts/host_puthex64/_write
+#endif
+
 //===----------------------------------------------------------------------===//
 // Trivial synchronous host semaphore
 //===----------------------------------------------------------------------===//
@@ -555,6 +559,37 @@ static iree_status_t iree_hal_cluster_device_submit_table(
       iree_hal_cluster_command_buffer_size(command_buffer);
   uint32_t record_count =
       iree_hal_cluster_command_buffer_record_count(command_buffer);
+
+#ifdef QCS_DUMP_GOLDEN
+  // Phase-0 GOLDEN QCS BYTE BASELINE (opt-in; the default build is byte-identical
+  // without this). Hexdumps the exact serialized stream over UART so a hand-
+  // written host (quidditch_gemm_minimal_main.c) can be byte-diffed against what
+  // the VM/HAL actually emitted -- both go through qcs_write_dispatch, so the
+  // streams must match exactly. Also prints stream_pa/len/records for the
+  // descriptor. Grep the console for "GOLDEN".
+  {
+    const uint8_t* s = (const uint8_t*)qcs_pa_to_ptr(device->region, stream_pa);
+    host_puts("[GOLDEN] stream_pa=0x");
+    host_puthex64(stream_pa);
+    host_puts(" len=0x");
+    host_puthex64((uint64_t)stream_size);
+    host_puts(" records=");
+    host_putu((unsigned long)record_count);
+    host_puts("\n[GOLDEN] bytes:");
+    for (uint32_t i = 0; i < stream_size; ++i) {
+      if ((i & 15u) == 0u) {
+        host_puts("\n[GOLDEN] +0x");
+        host_puthex64((uint64_t)i);
+        host_puts(": ");
+      }
+      // two-nibble hex per byte
+      static const char hx[] = "0123456789abcdef";
+      char b[3] = {hx[(s[i] >> 4) & 0xf], hx[s[i] & 0xf], ' '};
+      _write(1, b, 3);
+    }
+    host_puts("\n[GOLDEN] end\n");
+  }
+#endif  // QCS_DUMP_GOLDEN
 
   // Publish the job descriptor in the shared region.
   qcs_job_descriptor_t* job = qcs_shared_job(device->region);
