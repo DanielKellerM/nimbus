@@ -50,6 +50,11 @@ $GCC "${CFLAGS[@]}" -c $HERE/shared_region_cheshire.c        -o shared_region.o
 $GCC "${CFLAGS[@]}" -c $PARENT/transport/cluster_command_stream.c -o cluster_command_stream.o
 $GCC "${CFLAGS[@]}" -c $HERE/quidditch_gemm_minimal_main.c   -o quidditch_gemm_minimal_main.o
 
+# Generate the hybrid link script from the SoC addrmap (single source of truth with the firmware).
+if [ "$HOST_LD" = "$HERE/hybrid.ld" ]; then
+  $GCC -E -P -x c "-I$GW_GEN" "$HERE/hybrid.ld.in" -o "$HOST_LD"
+fi
+
 echo "== linking minimal ELF (crt0 + $HOST_LD + newlib) =="
 $GCC "${ARCH[@]}" -nostartfiles -Wl,--gc-sections \
   -T$HOST_LD -Wl,-L$CHS_LD_DIR -Wl,-L$HERE \
