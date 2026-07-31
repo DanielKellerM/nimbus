@@ -173,12 +173,11 @@ int main() {
       (const qcs_job_descriptor_t*)qcs_fw_pa_to_ptr(&region,
                                                     QCS_JOB_DESCRIPTOR_PA);
 
-  // The DM core owns the kernel table; build it before the workers need it.
-  if (snrt_is_dm_core()) {
+  // Only cluster 0's DM core builds the shared table; global barrier publishes it.
+  if (snrt_cluster_idx() == 0 && snrt_is_dm_core()) {
     gw_register_kernels(&g_table);
   }
-  // Sync so the table is published before any compute core enters the loop.
-  snrt_cluster_hw_barrier();
+  snrt_global_barrier();
 
   // NO-JOB GUARD (principled): a host that wakes cluster 0 WITHOUT publishing a
   // QCS descriptor (e.g. the proven simple_offload bring-up host, which only
