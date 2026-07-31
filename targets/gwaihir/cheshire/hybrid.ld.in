@@ -30,8 +30,9 @@
 INCLUDE common.ldh
 
 MEMORY {
-  /* Cheshire internal SPM: CVA6-executable + cached + coherent. 128 KiB HW. */
-  chsspm (rwx) : ORIGIN = 0x10000000, LENGTH = 0x00020000
+  /* Cheshire internal SPM (LLC-as-SPM), base+size from the SoC addrmap -- same conservative RDL value cheshire's own linker uses; host .text is ~4 KiB. */
+  chsspm (rwx) : ORIGIN = GW_CHESHIRE_INTERNAL_CHESHIRE_SPM_BASE_ADDR,
+                 LENGTH = GW_CHESHIRE_INTERNAL_CHESHIRE_SPM_SIZE
   /* Host data+stack: QCS arena top (base+0x40000) up to the return_code_array page (top 4K),
    * sized from GW_L2_SPM_TOTAL_SIZE so it tracks the addrmap (1 vs 2 tiles), not a fixed 2 MiB. */
   l2data (rw)  : ORIGIN = GW_L2_SPM_BASE_ADDR(0) + 0x40000,
