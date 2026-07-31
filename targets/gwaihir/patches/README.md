@@ -7,11 +7,24 @@ committed back into its submodule):
 Applies on the pinned gwaihir submodule (`targets/gwaihir/soc` @ `4eac10a`). Carries
 the co-sim bring-up mods on top of upstream: the 2×2/mini NoC cfg
 (`cfg/mini_gwaihir_noc.yml`), the SoC/tile/pkg RTL (`hw/cheshire_tile.sv`,
-`hw/cluster_tile.sv`, `hw/gwaihir_pkg.sv`, `hw/gwaihir_top.sv`), the phase-2
-testbench (`target/sim/{src/tb_gwaihir_top.sv,include/tb_gwaihir_tasks.svh}`), the
-snitch start shim, `sw/sw.mk`, and the cheshire seed/offload test hosts. HW deps
+`hw/cluster_tile.sv`, `hw/gwaihir_pkg.sv`, `hw/gwaihir_top.sv`, `hw/mem_tile.sv`), the
+phase-2 testbench (`target/sim/{src/tb_gwaihir_top.sv,include/tb_gwaihir_tasks.svh,
+src/fixture_gwaihir_top.sv}` + the `vcs`/`vsim` `OFFLOAD_IMAGE` plusarg), the snitch
+start shim, `sw/sw.mk`, and the cheshire seed/offload test hosts. The testbench
+carries all six preload arms: 0 JTAG · 1 serial-link · 2 UART · 3 hybrid host ·
+4 DRAM host · 5 headless offload (PRELMODE=5, no host). HW deps
 (cheshire/cva6/snitch_cluster) come from `soc/Bender.lock` via `bender checkout`, not
 this patch.
+
+**Provenance — regenerate, don't hand-edit.** This patch is a build artifact of a
+single canonical branch, not a hand-maintained file: the merged co-sim branch on the
+gwaihir fork (`DanielKellerM/gwaihir`, `merge/cosim-both-final`, base `4eac10a`),
+which unifies the DRAM-host line and the PRELMODE=5 headless line that had drifted
+apart (a patch-vs-fork-branch split). To update, commit to that branch and regen:
+```
+git -C <gwaihir-fork> diff 4eac10a..merge/cosim-both-final \
+  > <nimbus>/targets/gwaihir/patches/gwaihir-cosim.patch
+```
 
 Normally you don't apply this by hand — `../setup-gwaihir.sh` does it. Manually (from
 the nimbus root; the patch path must be absolute since `git -C` changes directory):

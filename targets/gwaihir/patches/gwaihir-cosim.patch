@@ -116,37 +116,22 @@ index 0b911f0..2c8e3de 100644
  
    // Add Assertion that no multicast / reduction can enter this tile!
 diff --git a/hw/cluster_tile.sv b/hw/cluster_tile.sv
-index 3662b00..3f9b8d7 100644
+index 3662b00..438dfc2 100644
 --- a/hw/cluster_tile.sv
 +++ b/hw/cluster_tile.sv
-@@ -56,11 +56,28 @@ module cluster_tile
+@@ -56,11 +56,14 @@ module cluster_tile
    // actual address range for this exact tile, but it is sufficient since
    // the NoC will take care of routing the request to the correct tile.
    localparam int unsigned NumTileAddrMapRules = 1;
-+  // The TileCfg demux rule must span the *entire* cluster-config aperture so that
-+  // any cluster-config request is steered to the tile-config path (the NoC then
-+  // routes it to the exact destination tile -- see the NOTE above).
-+  //
-+  // The previous hard-coded `Sam[ClusterConfigX3Y3SamIdx].end_addr` assumed a 4x4
-+  // mesh whose corner cluster is X3Y3; for any other mesh size the X3Y3 SAM index
-+  // does not exist. Instead, derive the top of the cluster-config aperture in a
-+  // mesh-size-agnostic way: the cluster-config regions are contiguous and equal in
-+  // size (one per cluster, laid out by floogen for the cluster array endpoint), so
-+  // the aperture top is the base plus NumClusters times the per-cluster region size.
-+  // This is value-identical to Sam[ClusterConfigX3Y3SamIdx].end_addr on the 4x4
-+  // default (0x6000_0000 + 16*0x1000 = 0x6001_0000) and correct for any NxM mesh
-+  // (e.g. 2x2 mini: 0x6000_0000 + 4*0x1000 = 0x6000_4000 == ClusterConfigX1Y1 end).
-+  localparam addr_t ClusterCfgBase = addr_t'(Sam[ClusterConfigX0Y0SamIdx].start_addr);
-+  localparam addr_t ClusterCfgRegionSize =
-+      addr_t'(Sam[ClusterConfigX0Y0SamIdx].end_addr - Sam[ClusterConfigX0Y0SamIdx].start_addr);
-+  localparam addr_t ClusterCfgTop = ClusterCfgBase + addr_t'(NumClusters) * ClusterCfgRegionSize;
++  // Last cluster-config SAM entry, derived from the grid (SAM has a fixed stride per endpoint) -- not a hardcoded corner.
++  localparam int unsigned SamCfgStride    = ClusterConfigX0Y1SamIdx - ClusterConfigX0Y0SamIdx;
++  localparam int unsigned LastClusterCfg  = ClusterConfigX0Y0SamIdx + (NumClusterX*NumClusterY-1)*SamCfgStride;
    addr_rule_t [NumTileAddrMapRules-1:0] TileAddrMap = '{
        '{
            idx: TileCfg,
--          start_addr: Sam[ClusterConfigX0Y0SamIdx].start_addr,
+           start_addr: Sam[ClusterConfigX0Y0SamIdx].start_addr,
 -          end_addr: Sam[ClusterConfigX3Y3SamIdx].end_addr
-+          start_addr: ClusterCfgBase,
-+          end_addr: ClusterCfgTop
++          end_addr: Sam[LastClusterCfg].end_addr
        }
    };
    localparam int unsigned NumTileApbAddrMapRules = 1;
@@ -198,6 +183,26 @@ index 97437f8..2e05e57 100644
      localparam id_t UcieId = Sam[UcieSamIdx].idx;
      localparam id_t UciePhysicalId = SamPhysical[UcieSamIdx].idx;
      localparam int UcieX = int'(UciePhysicalId.x);
+diff --git a/hw/mem_tile.sv b/hw/mem_tile.sv
+index fc5940c..1f94579 100644
+--- a/hw/mem_tile.sv
++++ b/hw/mem_tile.sv
+@@ -55,11 +55,14 @@ module mem_tile
+   // actual address range for this exact tile, but it is sufficient since
+   // the NoC will take care of routing the request to the correct tile.
+   localparam int unsigned NumTileAddrMapRules = 1;
++  // Last L2-SPM-config SAM entry, derived from NumL2Spm (same per-endpoint stride) -- not a hardcoded index.
++  localparam int unsigned SamCfgStride = ClusterConfigX0Y1SamIdx - ClusterConfigX0Y0SamIdx;
++  localparam int unsigned LastL2Cfg    = L2SpmConfig0SamIdx + (NumL2Spm-1)*SamCfgStride;
+   addr_rule_t [NumTileAddrMapRules-1:0] TileAddrMap = '{
+       '{
+           idx: TileCfg,
+           start_addr: Sam[L2SpmConfig0SamIdx].start_addr,
+-          end_addr: Sam[L2SpmConfig1SamIdx].end_addr
++          end_addr: Sam[LastL2Cfg].end_addr
+       }
+   };
+   localparam int unsigned NumTileApbAddrMapRules = 1;
 diff --git a/sw/cheshire/tests/access_clk_gating_rst_ctrl_reg.c b/sw/cheshire/tests/access_clk_gating_rst_ctrl_reg.c
 deleted file mode 100644
 index 4c65df5..0000000
@@ -242,173 +247,6 @@ index 4c65df5..0000000
 -
 -    return n_errors;
 -}
-diff --git a/sw/snitch/runtime/impl/snitch_cluster_start.h b/sw/snitch/runtime/impl/snitch_cluster_start.h
-index f791a51..49ce967 100644
---- a/sw/snitch/runtime/impl/snitch_cluster_start.h
-+++ b/sw/snitch/runtime/impl/snitch_cluster_start.h
-@@ -12,6 +12,11 @@
- #define SNRT_INIT_CLS
- #define SNRT_INIT_LIBS
- #define SNRT_CRT0_PRE_BARRIER
-+// NOTE: an SNRT_CRT0_CALLBACK1 wake marker that stored to L2-SPM (0x70010100)
-+// this early in crt0 WEDGED the run (cluster/NoC hang at ~103ms, host poll
-+// back-pressured) -- a snitch-core store to external memory before the cluster
-+// memory path is up. Removed; use the firmware's own dbg phases + a host-side
-+// C[0] dump instead (which reaches the poll on the run2-proven path).
- #define SNRT_INVOKE_MAIN
- #define SNRT_CRT0_POST_BARRIER
- #define SNRT_CRT0_EXIT
-diff --git a/sw/sw.mk b/sw/sw.mk
-index f5ae51c..cf27cfa 100644
---- a/sw/sw.mk
-+++ b/sw/sw.mk
-@@ -48,6 +48,7 @@ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/fused_concat_linear
- SN_APPS += $(GW_SNITCH_SW_DIR)/apps/mha
- SN_APPS += $(GW_SNITCH_SW_DIR)/apps/summa_gemm
- SN_APPS += $(GW_SNITCH_SW_DIR)/apps/power_benchmarks
-+SN_APPS += $(GW_SNITCH_SW_DIR)/apps/qcs_replay
- 
- SN_TESTS = $(wildcard $(GW_SNITCH_SW_DIR)/tests/*.c)
- 
-diff --git a/target/sim/include/tb_gwaihir_tasks.svh b/target/sim/include/tb_gwaihir_tasks.svh
-index 2548d8e..eeb6c15 100644
---- a/target/sim/include/tb_gwaihir_tasks.svh
-+++ b/target/sim/include/tb_gwaihir_tasks.svh
-@@ -155,6 +155,73 @@ task automatic fastmode_elf_preload(input string binary, output cheshire_pkg::do
-   $display("[FAST_PRELOAD] Preload complete");
- endtask
- 
-+// Phase-2 HYBRID host preload. The host ELF has two segments:
-+//   .text @ 0x10000000  -> Cheshire internal SPM: CVA6-executable + cached +
-+//                          coherent. Loaded over JTAG (the fastmode backdoor
-+//                          only reaches the L2-SPM tc_srams, and the Cheshire
-+//                          SPM lives inside the SoC). .text is ~121 KiB so the
-+//                          slow JTAG path is tolerable.
-+//   .misc/.bss @ 0x70014000 -> L2-SPM: CVA6 load/store-accessible (NOT fetch),
-+//                          shared with the cluster firmware. Backdoor-loaded
-+//                          via the fastmode tc_sram write path (instant).
-+// Requires the hart to be halted (jtag_wait_for_llc_config_halt) before the
-+// JTAG section load. Returns the ELF entry (0x10000000).
-+task automatic hybrid_host_elf_preload(input string binary, output cheshire_pkg::doub_bt entry);
-+  import floo_gwaihir_noc_pkg::*;
-+  longint sec_addr, sec_len, write_addr;
-+  $display("[HYBRID] Preloading host ELF binary: %s", binary);
-+  if (read_elf(binary)) $fatal(1, "[HYBRID] Failed to load ELF!");
-+  while (get_section(sec_addr, sec_len)) begin
-+    byte bf[] = new [sec_len];
-+    if (read_section(sec_addr, bf, sec_len)) $fatal(1, "[HYBRID] Failed to read ELF section!");
-+    if (sec_addr % 4 != 0 || sec_len % 4 != 0)
-+      $fatal(1, "[HYBRID] Section addr/len not word-aligned");
-+    if (sec_addr >= Sam[L2Spm0SamIdx].start_addr &&
-+        sec_addr <  Sam[L2Spm0SamIdx+2*NumMemTiles-2].end_addr) begin
-+      // L2-SPM data section: instant backdoor write.
-+      $display("[HYBRID] L2-SPM (fastmode) section @ 0x%h (%0d bytes)", sec_addr, sec_len);
-+      for (int i = 0; i < sec_len; i += 4) begin
-+        write_addr = sec_addr + i;
-+        fastmode_write_word(write_addr, {bf[i+3], bf[i+2], bf[i+1], bf[i]});
-+      end
-+    end else begin
-+      // Cheshire-SPM (or other in-SoC) executable section: JTAG load (hart must
-+      // already be halted by the caller).
-+      $display("[HYBRID] Cheshire-SPM (JTAG) section @ 0x%h (%0d bytes)", sec_addr, sec_len);
-+      fix.vip.jtag_load_section(sec_addr, bf, sec_len);
-+    end
-+  end
-+  void'(get_entry(entry));
-+  $display("[HYBRID] Host preload complete (entry 0x%h)", entry);
-+endtask
-+
-+// Phase-2 PRINCIPLED DRAM host preload. The host ELF (dram_host.ld) places ALL
-+// segments (.text/.misc/.bss/.arena) in external DRAM (0x80000000), which is now
-+// a real backing store: the gwaihir LLC master port is backed by an axi_sim_mem
-+// (i_llc_sim_mem) instead of an axi_err_slv. 0x80000000 is a CVA6 ExecuteRegion
-+// + CachedRegion, so the CVA6 fetches+runs the host directly from DRAM. We
-+// backdoor-write the ELF sections into the sim_mem byte array (instant), then the
-+// caller resumes hart 0 at the ELF entry (0x80000000). The QCS shared region +
-+// A/B/C live in the L2-SPM at runtime (carved by the cluster allocator); only the
-+// firmware is preloaded there. The LLC config / hart halt is handled by the
-+// caller (jtag_wait_for_llc_config_halt) exactly as the hybrid path.
-+task automatic dram_host_elf_preload(input string binary, output cheshire_pkg::doub_bt entry);
-+  longint sec_addr, sec_len;
-+  $display("[DRAM] Preloading host ELF binary into axi_sim_mem: %s", binary);
-+  if (read_elf(binary)) $fatal(1, "[DRAM] Failed to load ELF!");
-+  while (get_section(sec_addr, sec_len)) begin
-+    byte bf[] = new [sec_len];
-+    if (read_section(sec_addr, bf, sec_len)) $fatal(1, "[DRAM] Failed to read ELF section!");
-+    $display("[DRAM] sim_mem section @ 0x%h (%0d bytes)", sec_addr, sec_len);
-+    // axi_sim_mem.mem is a byte-indexed associative array keyed by full address.
-+    for (longint i = 0; i < sec_len; i++) begin
-+      fix.dut.i_cheshire_tile.i_llc_sim_mem.mem[sec_addr + i] = bf[i];
-+    end
-+  end
-+  void'(get_entry(entry));
-+  $display("[DRAM] Host preload complete (entry 0x%h)", entry);
-+endtask
-+
- // Suitable for loading ELFs with 32b-aligned sections
- task automatic jtag_32b_elf_preload(input string binary, output bit [63:0] entry);
-   longint sec_addr, sec_len;
-diff --git a/target/sim/src/tb_gwaihir_top.sv b/target/sim/src/tb_gwaihir_top.sv
-index 1d9da46..4e167de 100644
---- a/target/sim/src/tb_gwaihir_top.sv
-+++ b/target/sim/src/tb_gwaihir_top.sv
-@@ -26,11 +26,12 @@ module tb_gwaihir_top;
-   string        preload_elf;
-   string        boot_hex;
-   logic  [ 1:0] boot_mode;
--  logic  [ 1:0] preload_mode;
-+  logic  [ 3:0] preload_mode;  // widened: PRELMODE=4 (DRAM) needs >2 bits
-   bit    [31:0] exit_code;
-   bit           snitch_preload;
-   string        snitch_elf;
-   logic  [63:0] snitch_entry;
-+  logic  [63:0] chs_entry;
-   int           snitch_fn;
-   int           chs_fn;
- 
-@@ -85,14 +86,39 @@ module tb_gwaihir_top;
-             $fatal(1, "Unsupported snitch binary preload mode %d (UART)!", preload_mode);
-           fix.vip.uart_debug_elf_run_and_wait(preload_elf, exit_code);
-         end
--        3: begin  // Fast Mode
-+        3: begin  // Fast Mode (Phase-2 HYBRID host placement)
-           jtag_enable_tiles();  // Write control registers
-           if (snitch_preload) fastmode_elf_preload(snitch_elf, snitch_entry);
--          // TODO(fischeti): Implement fast mode for Cheshire binary
--          fix.vip.jtag_elf_run(preload_elf);
-+          // Phase-2 host blocker fix: the host ELF (hybrid.ld) splits into
-+          //   .text @ 0x10000000 (Cheshire SPM: the ONLY CVA6-executable +
-+          //                       coherent region big enough -- 128 KiB HW),
-+          //   .misc/.bss @ 0x70014000 (L2-SPM: CVA6 load/store + cluster-shared).
-+          // The L2-SPM aperture (0x70000000) is NOT a CVA6 ExecuteRegion, so
-+          // fetching the host from there returns X (the original blocker).
-+          // Backdoor the L2-SPM data, JTAG-load .text into the Cheshire SPM,
-+          // then resume from the ELF entry (0x10000000).
-+          fix.vip.jtag_init();
-+          fix.vip.jtag_wait_for_llc_config_halt();  // wait LLC cfg + halt hart 0
-+          hybrid_host_elf_preload(preload_elf, chs_entry);  // L2 fastmode + SPM JTAG
-+          fix.vip.jtag_elf_run_no_preload(preload_elf);  // set PC=entry + resume
-           fix.vip.jtag_wait_for_eoc(exit_code);
-           if (snitch_preload) fastmode_read();
-         end
-+        4: begin  // PRINCIPLED DRAM host placement (axi_sim_mem behind the LLC)
-+          jtag_enable_tiles();  // Write control registers
-+          if (snitch_preload) jtag_32b_elf_preload(snitch_elf, snitch_entry);  // DIAG: JTAG fw preload (isolate fastmode)
-+          // The host ELF is linked entirely into external DRAM (0x80000000),
-+          // which is now a real CVA6-executable+cached memory: the gwaihir LLC
-+          // master port is backed by axi_sim_mem (i_llc_sim_mem), not an
-+          // axi_err_slv. Backdoor the ELF into the sim_mem, then resume hart 0
-+          // at the DRAM entry. No SPM crutch, no JTAG text load.
-+          fix.vip.jtag_init();
-+          fix.vip.jtag_wait_for_llc_config_halt();  // wait LLC cfg + halt hart 0
-+          dram_host_elf_preload(preload_elf, chs_entry);  // sim_mem backdoor
-+          fix.vip.jtag_elf_run_no_preload(preload_elf);   // set PC=entry + resume
-+          fix.vip.jtag_wait_for_eoc(exit_code);
-+          // if (snitch_preload) fastmode_read();  // DIAG: disabled (JTAG fw above)
-+        end
-         default: begin
-           $fatal(1, "Unsupported preload mode %d (reserved)!", boot_mode);
-         end
 diff --git a/sw/cheshire/tests/qcs_gemm_seed.c b/sw/cheshire/tests/qcs_gemm_seed.c
 new file mode 100644
 index 0000000..a4848b0
@@ -848,3 +686,288 @@ index 0000000..1cafe41
 +
 +  return sum;
 +}
+diff --git a/sw/snitch/runtime/impl/snitch_cluster_start.h b/sw/snitch/runtime/impl/snitch_cluster_start.h
+index f791a51..49ce967 100644
+--- a/sw/snitch/runtime/impl/snitch_cluster_start.h
++++ b/sw/snitch/runtime/impl/snitch_cluster_start.h
+@@ -12,6 +12,11 @@
+ #define SNRT_INIT_CLS
+ #define SNRT_INIT_LIBS
+ #define SNRT_CRT0_PRE_BARRIER
++// NOTE: an SNRT_CRT0_CALLBACK1 wake marker that stored to L2-SPM (0x70010100)
++// this early in crt0 WEDGED the run (cluster/NoC hang at ~103ms, host poll
++// back-pressured) -- a snitch-core store to external memory before the cluster
++// memory path is up. Removed; use the firmware's own dbg phases + a host-side
++// C[0] dump instead (which reaches the poll on the run2-proven path).
+ #define SNRT_INVOKE_MAIN
+ #define SNRT_CRT0_POST_BARRIER
+ #define SNRT_CRT0_EXIT
+diff --git a/sw/sw.mk b/sw/sw.mk
+index f5ae51c..763804b 100644
+--- a/sw/sw.mk
++++ b/sw/sw.mk
+@@ -41,6 +41,7 @@ SN_TESTS_INCDIRS  = $(SN_ROOT)/sw/kernels/blas
+ SN_BUILD_APPS = OFF
+ 
+ SN_APPS  = $(GW_SNITCH_SW_DIR)/apps/gemm_2d
++SN_APPS += $(GW_SNITCH_SW_DIR)/apps/qcs_replay
+ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/gemm
+ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/axpy
+ SN_APPS += $(SN_ROOT)/sw/kernels/dnn/flashattention_2
+@@ -48,6 +49,7 @@ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/fused_concat_linear
+ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/mha
+ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/summa_gemm
+ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/power_benchmarks
++SN_APPS += $(GW_SNITCH_SW_DIR)/apps/qcs_replay
+ 
+ SN_TESTS = $(wildcard $(GW_SNITCH_SW_DIR)/tests/*.c)
+ 
+diff --git a/target/sim/include/tb_gwaihir_tasks.svh b/target/sim/include/tb_gwaihir_tasks.svh
+index 2548d8e..a92e7de 100644
+--- a/target/sim/include/tb_gwaihir_tasks.svh
++++ b/target/sim/include/tb_gwaihir_tasks.svh
+@@ -155,6 +155,145 @@ task automatic fastmode_elf_preload(input string binary, output cheshire_pkg::do
+   $display("[FAST_PRELOAD] Preload complete");
+ endtask
+ 
++// Phase-2 HYBRID host preload. The host ELF has two segments:
++//   .text @ 0x10000000  -> Cheshire internal SPM: CVA6-executable + cached +
++//                          coherent. Loaded over JTAG (the fastmode backdoor
++//                          only reaches the L2-SPM tc_srams, and the Cheshire
++//                          SPM lives inside the SoC). .text is ~121 KiB so the
++//                          slow JTAG path is tolerable.
++//   .misc/.bss @ 0x70014000 -> L2-SPM: CVA6 load/store-accessible (NOT fetch),
++//                          shared with the cluster firmware. Backdoor-loaded
++//                          via the fastmode tc_sram write path (instant).
++// Requires the hart to be halted (jtag_wait_for_llc_config_halt) before the
++// JTAG section load. Returns the ELF entry (0x10000000).
++task automatic hybrid_host_elf_preload(input string binary, output cheshire_pkg::doub_bt entry);
++  import floo_gwaihir_noc_pkg::*;
++  longint sec_addr, sec_len, write_addr;
++  $display("[HYBRID] Preloading host ELF binary: %s", binary);
++  if (read_elf(binary)) $fatal(1, "[HYBRID] Failed to load ELF!");
++  while (get_section(sec_addr, sec_len)) begin
++    byte bf[] = new [sec_len];
++    if (read_section(sec_addr, bf, sec_len)) $fatal(1, "[HYBRID] Failed to read ELF section!");
++    if (sec_addr % 4 != 0 || sec_len % 4 != 0)
++      $fatal(1, "[HYBRID] Section addr/len not word-aligned");
++    if (sec_addr >= Sam[L2Spm0SamIdx].start_addr &&
++        sec_addr <  Sam[L2Spm0SamIdx+2*NumMemTiles-2].end_addr) begin
++      // L2-SPM data section: instant backdoor write.
++      $display("[HYBRID] L2-SPM (fastmode) section @ 0x%h (%0d bytes)", sec_addr, sec_len);
++      for (int i = 0; i < sec_len; i += 4) begin
++        write_addr = sec_addr + i;
++        fastmode_write_word(write_addr, {bf[i+3], bf[i+2], bf[i+1], bf[i]});
++      end
++    end else begin
++      // Cheshire-SPM (or other in-SoC) executable section: JTAG load (hart must
++      // already be halted by the caller).
++      $display("[HYBRID] Cheshire-SPM (JTAG) section @ 0x%h (%0d bytes)", sec_addr, sec_len);
++      fix.vip.jtag_load_section(sec_addr, bf, sec_len);
++    end
++  end
++  void'(get_entry(entry));
++  $display("[HYBRID] Host preload complete (entry 0x%h)", entry);
++endtask
++
++// Phase-2 PRINCIPLED DRAM host preload. The host ELF (dram_host.ld) places ALL
++// segments (.text/.misc/.bss/.arena) in external DRAM (0x80000000), which is now
++// a real backing store: the gwaihir LLC master port is backed by an axi_sim_mem
++// (i_llc_sim_mem) instead of an axi_err_slv. 0x80000000 is a CVA6 ExecuteRegion
++// + CachedRegion, so the CVA6 fetches+runs the host directly from DRAM. We
++// backdoor-write the ELF sections into the sim_mem byte array (instant), then the
++// caller resumes hart 0 at the ELF entry (0x80000000). The QCS shared region +
++// A/B/C live in the L2-SPM at runtime (carved by the cluster allocator); only the
++// firmware is preloaded there. The LLC config / hart halt is handled by the
++// caller (jtag_wait_for_llc_config_halt) exactly as the hybrid path.
++task automatic dram_host_elf_preload(input string binary, output cheshire_pkg::doub_bt entry);
++  longint sec_addr, sec_len;
++  $display("[DRAM] Preloading host ELF binary into axi_sim_mem: %s", binary);
++  if (read_elf(binary)) $fatal(1, "[DRAM] Failed to load ELF!");
++  while (get_section(sec_addr, sec_len)) begin
++    byte bf[] = new [sec_len];
++    if (read_section(sec_addr, bf, sec_len)) $fatal(1, "[DRAM] Failed to read ELF section!");
++    $display("[DRAM] sim_mem section @ 0x%h (%0d bytes)", sec_addr, sec_len);
++    // axi_sim_mem.mem is a byte-indexed associative array keyed by full address.
++    for (longint i = 0; i < sec_len; i++) begin
++      fix.dut.i_cheshire_tile.i_llc_sim_mem.mem[sec_addr + i] = bf[i];
++    end
++  end
++  void'(get_entry(entry));
++  $display("[DRAM] Host preload complete (entry 0x%h)", entry);
++endtask
++
++// Headless offload (tb-driven simple_offload): preload firmware + optional job, set scratch, wake, poll return codes -- no host.
++task automatic headless_offload(output logic [31:0] exit_code);
++  import floo_gwaihir_noc_pkg::*;
++  // HW counts + L2 aperture come from the SoC cfg/addrmap, never hardcoded.
++  localparam int     NR_CLUSTERS = NumClusters;
++  localparam int     NR_CORES    = snitch_cluster_pkg::NrCores;      // 8 compute + 1 DM
++  localparam longint L2_BASE     = Sam[L2Spm0SamIdx].start_addr;
++  localparam longint RC_BASE     = Sam[L2Spm0SamIdx + 2*NumMemTiles - 2].end_addr - 'h1000; // return_code page = top 4K
++  localparam longint IMG_PA     = L2_BASE + 'h10000;                // job-descriptor offset within the image
++  string img_path;
++  int    fp, i, cl, core, iter, ndone, nfail, expect_done;
++  longint stream_pa, c_off, c_len, b;
++  logic [31:0] word, rc, bcount;
++  realtime t_wake;
++
++  // 1) optional: preload a command-stream job image + zero its output (plain apps like summa_gemm carry their own data)
++  if ($value$plusargs("OFFLOAD_IMAGE=%s", img_path)) begin
++    fp = $fopen(img_path, "r");
++    if (fp == 0) $fatal(1, "[OFFLOAD] cannot open image %s", img_path);
++    i = 0;
++    while ($fscanf(fp, "%h", word) == 1) begin fastmode_write_word(IMG_PA + i*4, word); i++; end
++    $fclose(fp);
++    $display("[OFFLOAD] loaded %0d words @0x%h from %s", i, IMG_PA, img_path);
++    fastmode_read_word(IMG_PA + 'h28, word);                       stream_pa = L2_BASE + word;   // descriptor.cmd_stream_ptr
++    fastmode_read_word(stream_pa + 'h3c, bcount);                                                 // dispatch.binding_count
++    fastmode_read_word(stream_pa + 'h40 + (bcount-1)*16,     word); c_off = word;                 // last binding device_ptr
++    fastmode_read_word(stream_pa + 'h40 + (bcount-1)*16 + 8, word); c_len = word;                 //              length
++    for (b = 0; b < c_len; b += 4) fastmode_write_word(L2_BASE + c_off + b, 32'h0);
++    $display("[OFFLOAD] zeroed output binding @0x%h (%0d bytes)", L2_BASE + c_off, c_len);
++  end else begin
++    $display("[OFFLOAD] no image -- plain bare-metal offload (firmware carries its own data)");
++  end
++
++  // 2) zero the return-code page
++  for (i = 0; i < NR_CLUSTERS*NR_CORES; i++)
++    fastmode_write_word(RC_BASE + i*4, 32'h0);
++
++  // 3) per-cluster scratch: [1]=firmware entry (L2 base), [0]=&return_code_array[cl][0]
++  for (cl = 0; cl < NR_CLUSTERS; cl++) begin
++    fix.vip.jtag_write_reg32(`CLUSTER_PERIPHERAL_REG_SCRATCH_BASE_ADDR(cl,1),     L2_BASE[31:0], 1'b0);
++    fix.vip.jtag_write_reg32(`CLUSTER_PERIPHERAL_REG_SCRATCH_BASE_ADDR(cl,1) + 4, 32'h0,         1'b0);
++    fix.vip.jtag_write_reg32(`CLUSTER_PERIPHERAL_REG_SCRATCH_BASE_ADDR(cl,0),     (RC_BASE + cl*NR_CORES*4), 1'b0);
++    fix.vip.jtag_write_reg32(`CLUSTER_PERIPHERAL_REG_SCRATCH_BASE_ADDR(cl,0) + 4, 32'h0,         1'b0);
++  end
++
++  // 4) wake cluster 0 (snRuntime fans out to the others through the world barrier); start the timer
++  expect_done = NR_CLUSTERS*NR_CORES;
++  t_wake = $realtime;
++  fix.vip.jtag_write_reg32(`CLUSTER_PERIPHERAL_REG_CL_CLINT_SET_BASE_ADDR(0), 32'h1FF, 1'b0);
++  $display("[OFFLOAD] woke cluster 0, polling %0d return-code slots ...", expect_done);
++
++  // 5) poll return codes (bit0=done, bits[31:1]=rc) until all done or timeout
++  for (iter = 0; iter < 200000; iter++) begin
++    #1us;
++    ndone = 0; nfail = 0;
++    for (cl = 0; cl < NR_CLUSTERS; cl++)
++      for (core = 0; core < NR_CORES; core++) begin
++        fastmode_read_word(RC_BASE + (cl*NR_CORES + core)*4, rc);
++        if (rc[0]) begin ndone++; if (rc[31:1] != 0) nfail++; end
++      end
++    if (ndone == expect_done) begin
++      $display("[OFFLOAD] COMPLETE done=%0d/%0d fail=%0d  wake->done=%.0f ns", ndone, expect_done, nfail, $realtime - t_wake);
++      exit_code = (nfail != 0);
++      fastmode_read();
++      return;
++    end
++  end
++  $display("[OFFLOAD] TIMEOUT done=%0d/%0d", ndone, expect_done);
++  exit_code = 32'hFF;
++  fastmode_read();
++endtask
++
+ // Suitable for loading ELFs with 32b-aligned sections
+ task automatic jtag_32b_elf_preload(input string binary, output bit [63:0] entry);
+   longint sec_addr, sec_len;
+diff --git a/target/sim/src/fixture_gwaihir_top.sv b/target/sim/src/fixture_gwaihir_top.sv
+index f2adf74..3d27962 100644
+--- a/target/sim/src/fixture_gwaihir_top.sv
++++ b/target/sim/src/fixture_gwaihir_top.sv
+@@ -131,6 +131,7 @@ module fixture_gwaihir_top;
+   vip_cheshire_soc #(
+     .DutCfg           (CheshireCfg),
+     .UseDramSys       (1'b0),
++    .ClkPeriodJtag    (4ns),   // 50MHz->250MHz: shorter preload sim-time => fewer sys-clk edges => faster wall-clock
+     .axi_ext_llc_req_t(axi_llc_req_t),
+     .axi_ext_llc_rsp_t(axi_llc_rsp_t),
+     .axi_ext_mst_req_t(axi_mst_req_t),
+diff --git a/target/sim/src/tb_gwaihir_top.sv b/target/sim/src/tb_gwaihir_top.sv
+index 1d9da46..2584a1a 100644
+--- a/target/sim/src/tb_gwaihir_top.sv
++++ b/target/sim/src/tb_gwaihir_top.sv
+@@ -26,11 +26,12 @@ module tb_gwaihir_top;
+   string        preload_elf;
+   string        boot_hex;
+   logic  [ 1:0] boot_mode;
+-  logic  [ 1:0] preload_mode;
++  logic  [ 3:0] preload_mode;  // widened: PRELMODE=4 (DRAM) needs >2 bits
+   bit    [31:0] exit_code;
+   bit           snitch_preload;
+   string        snitch_elf;
+   logic  [63:0] snitch_entry;
++  logic  [63:0] chs_entry;
+   int           snitch_fn;
+   int           chs_fn;
+ 
+@@ -85,14 +86,33 @@ module tb_gwaihir_top;
+             $fatal(1, "Unsupported snitch binary preload mode %d (UART)!", preload_mode);
+           fix.vip.uart_debug_elf_run_and_wait(preload_elf, exit_code);
+         end
+-        3: begin  // Fast Mode
++        3: begin  // Fast Mode (Phase-2 HYBRID host placement)
+           jtag_enable_tiles();  // Write control registers
+           if (snitch_preload) fastmode_elf_preload(snitch_elf, snitch_entry);
+-          // TODO(fischeti): Implement fast mode for Cheshire binary
+-          fix.vip.jtag_elf_run(preload_elf);
++          // hybrid.ld: .text -> Cheshire SPM (only big CVA6-exec region), .misc/.bss -> L2-SPM (not fetchable). Backdoor L2, JTAG .text, resume at entry.
++          fix.vip.jtag_init();
++          fix.vip.jtag_wait_for_llc_config_halt();  // wait LLC cfg + halt hart 0
++          hybrid_host_elf_preload(preload_elf, chs_entry);  // L2 fastmode + SPM JTAG
++          fix.vip.jtag_elf_run_no_preload(preload_elf);  // set PC=entry + resume
+           fix.vip.jtag_wait_for_eoc(exit_code);
+           if (snitch_preload) fastmode_read();
+         end
++        4: begin  // PRINCIPLED DRAM host placement (axi_sim_mem behind the LLC)
++          jtag_enable_tiles();  // Write control registers
++          if (snitch_preload) jtag_32b_elf_preload(snitch_elf, snitch_entry);  // DIAG: JTAG fw preload (isolate fastmode)
++          // Host ELF linked into external DRAM (0x80000000), backed by axi_sim_mem (CVA6-exec+cached). Backdoor ELF into sim_mem, resume hart 0 at entry.
++          fix.vip.jtag_init();
++          fix.vip.jtag_wait_for_llc_config_halt();  // wait LLC cfg + halt hart 0
++          dram_host_elf_preload(preload_elf, chs_entry);  // sim_mem backdoor
++          fix.vip.jtag_elf_run_no_preload(preload_elf);   // set PC=entry + resume
++          fix.vip.jtag_wait_for_eoc(exit_code);
++          // if (snitch_preload) fastmode_read();  // DIAG: disabled (JTAG fw above)
++        end
++        5: begin  // headless offload: run a cluster job with no host (tb-driven simple_offload)
++          jtag_enable_tiles();
++          if (snitch_preload) fastmode_elf_preload(snitch_elf, snitch_entry);
++          headless_offload(exit_code);
++        end
+         default: begin
+           $fatal(1, "Unsupported preload mode %d (reserved)!", boot_mode);
+         end
+diff --git a/target/sim/vcs/vcs.mk b/target/sim/vcs/vcs.mk
+index d0c6e4b..ded25fb 100644
+--- a/target/sim/vcs/vcs.mk
++++ b/target/sim/vcs/vcs.mk
+@@ -18,6 +18,7 @@ VLOGAN_ARGS += -assert svaext
+ VLOGAN_ARGS += -timescale=1ns/1ps
+ VLOGAN_ARGS += -nc
+ 
++VCS_FLAGS += -fgp=num_threads:8
+ VCS_FLAGS_GUI  = -debug_access+all
+ 
+ define add_vcs_flag
+@@ -30,6 +31,7 @@ $(eval $(call add_vcs_flag,CHS_BINARY))
+ $(eval $(call add_vcs_flag,SN_BINARY))
+ $(eval $(call add_vcs_flag,BOOTMODE))
+ $(eval $(call add_vcs_flag,PRELMODE))
++$(eval $(call add_vcs_flag,OFFLOAD_IMAGE))
+ 
+ .PHONY: vcs-compile vcs-compile-batch vcs-clean vcs-run vcs-run-batch
+ 
+diff --git a/target/sim/vsim/vsim.mk b/target/sim/vsim/vsim.mk
+index bfaff8e..59ba370 100644
+--- a/target/sim/vsim/vsim.mk
++++ b/target/sim/vsim/vsim.mk
+@@ -36,6 +36,7 @@ $(eval $(call add_vsim_flag,CHS_BINARY))
+ $(eval $(call add_vsim_flag,SN_BINARY))
+ $(eval $(call add_vsim_flag,BOOTMODE))
+ $(eval $(call add_vsim_flag,PRELMODE))
++$(eval $(call add_vsim_flag,OFFLOAD_IMAGE))
+ 
+ .PHONY: vsim-compile vsim-clean vsim-run
+ 
