@@ -57,14 +57,15 @@ static void fill_inputs(double* a, double* b) {
   }
 }
 
-// Golden C = A @ B^T (matmul_transpose_b): C[i,j] = sum_k A[i,k] * B[j,k].
-static void golden_gemm(const double* a, const double* b, double* c) {
-  for (int i = 0; i < N; ++i)
-    for (int j = 0; j < N; ++j) {
-      double acc = 0.0;
-      for (int k = 0; k < N; ++k) acc += a[i * N + k] * b[j * N + k];
-      c[i * N + j] = acc;
-    }
+// Golden C[i,j] = sum_k A[i,k]*B[j,k] (matmul_transpose_b), computed from the known
+// deterministic inputs (a[x]=x+1, b[x]=2(x+1)) by formula -- NOT by re-reading A/B
+// from uncached L2-SPM. The device output C is read back separately (the real test);
+// recomputing the reference on-device via 2*N^3 uncached loads is intractable in RTL sim.
+static double golden_elem(int i, int j) {
+  double acc = 0.0;
+  for (int k = 0; k < N; ++k)
+    acc += (double)(i * N + k + 1) * (double)(2 * (j * N + k + 1));
+  return acc;
 }
 
 int main(void) {
@@ -139,27 +140,55 @@ int main(void) {
   }
   host_puts("[host-min] cluster completed OK\n");
 
-  // Verify C == A @ B^T against a host-side golden.
-  static double C_gold[N * N];
-  golden_gemm(A, B, C_gold);
-  __asm__ volatile("fence" ::: "memory");
-
+  // Read the device output C back (the actual test) and compare each element to
+  // the formula-computed golden -- no C_gold buffer, no uncached A/B reloads.
+  // Tally mismatches per 16x16 workgroup block (the 4x4 grid) to localize the bug.
   int mism = 0;
-  for (int i = 0; i < N * N; ++i) {
-    double diff = C[i] - C_gold[i];
-    if (diff < 0) diff = -diff;
-    double tol = 1e-6 * (C_gold[i] < 0 ? -C_gold[i] : C_gold[i]) + 1e-9;
-    if (diff > tol) ++mism;
-  }
+  int blk[16] = {0};
+  int fi = -1, fj = -1;
+  double fgot = 0, fgold = 0;
+  for (int i = 0; i < N; ++i)
+    for (int j = 0; j < N; ++j) {
+      double gold = golden_elem(i, j);
+      double got = C[i * N + j];
+      double diff = got - gold;
+      if (diff < 0) diff = -diff;
+      double tol = 1e-6 * (gold < 0 ? -gold : gold) + 1e-9;
+      if (diff > tol) {
+        ++mism;
+        ++blk[(i / 16) * 4 + (j / 16)];
+        if (fi < 0) { fi = i; fj = j; fgot = got; fgold = gold; }
+      }
+    }
   host_puts("[host-min] C[0]=");
   host_putu((unsigned long)(long)C[0]);
   host_puts(" gold=");
-  host_putu((unsigned long)(long)C_gold[0]);
+  host_putu((unsigned long)(long)golden_elem(0, 0));
   host_puts(" C[4095]=");
   host_putu((unsigned long)(long)C[N * N - 1]);
   host_puts(" gold=");
-  host_putu((unsigned long)(long)C_gold[N * N - 1]);
+  host_putu((unsigned long)(long)golden_elem(N - 1, N - 1));
   host_puts("\n");
+  host_puts("[host-min] mismatch blocks (4x4 of 16x16):\n");
+  for (int bi = 0; bi < 4; ++bi) {
+    host_puts("[host-min]  ");
+    for (int bj = 0; bj < 4; ++bj) {
+      host_putu((unsigned long)blk[bi * 4 + bj]);
+      host_puts(" ");
+    }
+    host_puts("\n");
+  }
+  if (fi >= 0) {
+    host_puts("[host-min] first mism (i,j)=(");
+    host_putu((unsigned long)(long)fi);
+    host_puts(",");
+    host_putu((unsigned long)(long)fj);
+    host_puts(") got=");
+    host_putu((unsigned long)(long)fgot);
+    host_puts(" gold=");
+    host_putu((unsigned long)(long)fgold);
+    host_puts("\n");
+  }
 
   if (mism == 0) {
     host_puts("[host-min] *** PASS: C == A @ B^T ***\n");
