@@ -40,7 +40,7 @@
 // The kernel object (lib/gemm_square_kernel.o) exports exactly one *global*
 // symbol of interest: the IREE static-library query
 // `quidditch_gemm64_dispatch_0_library_query`. The actual dispatch entry points
-// (e.g. `gemm64_dispatch_0_matmul_16x16x16_f64$iree_to_xdsl`, the IREE->xDSL
+// (e.g. `gemm64_dispatch_0_matmul_64x64x64_f64$iree_to_xdsl`, the IREE->xDSL
 // adapter that fans out to the `$xdsl_kernel*` compute partitions / `$dma` DMA
 // partition) are LOCAL symbols, reachable only through this query's export
 // table -- so we MUST register via the library query rather than an extern

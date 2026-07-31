@@ -1,100 +1,88 @@
 #!/usr/bin/env bash
-# PRINCIPLED no-stubs DRAM host build (host-device split Phase 2).
+# No-stubs DRAM host build (host-device split): the IREE EmitC host VM runner as a
+# Cheshire/CVA6 baremetal binary running entirely from external DRAM, linked against
+# the REAL newlib libc/libm + libgcc -- no hand-stubbed libc/libm, no
+# --allow-multiple-definition. Output: quidditch_gemm.dram.elf (tb PRELMODE=4).
 #
-# Builds the IREE EmitC host VM runner as a Cheshire/CVA6 baremetal SW binary
-# that runs ENTIRELY from external DRAM (0x80000000), linked against the REAL
-# IIS newlib libc/libm + libgcc -- NO hand-stubbed libc/libm, NO
-# --allow-multiple-definition.
+# RV defaults to gcc-13.2.0 on purpose: its rv64/lp64d libgcc/libc/libm have ZERO
+# absolute R_RISCV_HI20 relocs, so they link cleanly with -mcmodel=medany at the DRAM
+# base 0x80000000 -- gcc-12.2.0's libgcc has 130 and truncates. Do not lower it.
 #
-# Toolchain: riscv64-gcc-13.2.0. Its rv64imafdc/lp64d libgcc/libc/libm have ZERO
-# absolute R_RISCV_HI20 relocs (verified: libgcc 0, libc 0, libm 0; the 12.2.0
-# libgcc has 130 -> truncate at the DRAM 0x80000000 base). So they link cleanly
-# with -mcmodel=medany at DRAM, exactly as cheshire/sw/sw.mk builds DRAM SW.
-#
-# Kept shims (genuinely unprovided by newlib/libcheshire, NOT workarounds):
-#   * pthread_stubs.o    -- newlib has no pthread; single-hart no-op mutexes.
-#   * iree_io_stubs.o    -- IREE-internal file-handle symbols, never in any lib.
-#   * cheshire_bridge.c  -- _write -> Cheshire _putchar(UART); _sbrk over a small
-#                           static heap (newlib needs it; libcheshire has none).
-# DROPPED (now real): libc_stubs.o (memcpy/memset/malloc/strtod... -> newlib),
-#   libm_stubs.o (__trunctfdf2/frexp/scalbn/... -> libgcc/libm, zero-HI20 in 13.2),
-#   syscalls.o (spike HTIF), --allow-multiple-definition.
-#
-# Output: quidditch_gemm.dram.elf, loaded by the gwaihir sim via the backdoor
-# sim_mem path (tb dram_host_elf_preload, PRELMODE=4).
+# Kept shims (genuinely unprovided, not workarounds): pthread_stubs.o (newlib has no
+# pthread), iree_io_stubs.o (IREE-internal file-handle symbols), cheshire_bridge.c
+# (_write->UART, _sbrk over a static heap).
 set -euo pipefail
 
-# REAL IIS toolchain: 13.2.0 (zero absolute HI20 in libgcc/libc/libm).
-RV=/usr/pack/riscv-1.0-kgf/riscv64-gcc-13.2.0/bin
-PFX=$RV/riscv64-unknown-elf-
-GCC=${PFX}gcc
+usage() {
+  cat >&2 <<EOF
+usage: GW=<..> IREE_SRC=<..> IREE_BUILD=<..> EMITC=<..> [RV=<bin>] [BUILD_DIR=<dir>] [HOST_LD=<ld>] ${0##*/}
+  GW         gwaihir build tree with .bender (cheshire checkout) + .generated   [required]
+  IREE_SRC   IREE source tree (headers)                                          [default: \$QUIDDITCH_ROOT/iree]
+  IREE_BUILD IREE rv64 baremetal build tree (the vm/hal/base archives)           [required]
+  EMITC      dir with the generated gemm_square_emitc.c + prebuilt *_stubs.o     [required]
+  RV         riscv64 gcc bin dir   [default: gcc-13.2.0 -- see the reloc note above; do not lower]
+  BUILD_DIR  .o/.elf output dir     [default: <script dir>/build]
+  HOST_LD    link script           [default: dram_host.ld beside this script]
+EOF
+  exit 2
+}
 
-IREE_SRC=/home/dankeller/Projects/Quidditch/iree
-IREE_BUILD=/scratch/dankeller/snitch-compiler/iree-rv64-baremetal/build
-LIBDIR=$IREE_BUILD/runtime/src/iree
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this repo's cheshire host sources
+TARGET_DIR="$(dirname "$HERE")"                         # targets/gwaihir (transport/, hal/)
+NIMBUS_ROOT="$(cd "$TARGET_DIR/../.." && pwd)"
 
-PARENT=/scratch/dankeller/snitch-compiler/iree-rv64-host
-EMITC=$PARENT/emitc
-HERE=$PARENT/cheshire
-cd "$HERE"
+RV="${RV:-/usr/pack/riscv-1.0-kgf/riscv64-gcc-13.2.0/bin}"
+PFX="$RV/riscv64-unknown-elf-"
+GCC="${PFX}gcc"
+[ -x "$GCC" ] || { echo "no riscv gcc at '$GCC' -- set RV" >&2; exit 1; }
 
-# gwaihir + cheshire trees via the in-repo .gwaihir symlink (re-point per machine, or set $GW)
-GW=${GW:-$(dirname "$IREE_SRC")/.gwaihir}
-CHS=$GW/.bender/git/checkouts/cheshire-09830518097f85c0
-GW_GEN=$GW/.generated
+: "${GW:?set GW to the gwaihir build tree (has .bender + .generated)}" || usage
+IREE_SRC="${IREE_SRC:-${QUIDDITCH_ROOT:-$NIMBUS_ROOT/quidditch}/iree}"
+: "${IREE_BUILD:?set IREE_BUILD to the IREE rv64 baremetal build tree}" || usage
+: "${EMITC:?set EMITC to the generated EmitC dir (gemm_square_emitc.c + *_stubs.o)}" || usage
+[ -d "$IREE_SRC/runtime/src" ] || { echo "IREE_SRC='$IREE_SRC' has no runtime/src" >&2; exit 1; }
 
-CHS_SW=$CHS/sw
-CHS_CRT0=$CHS_SW/lib/crt0.o
-CHS_LIB=$CHS_SW/lib/libcheshire.a
-CHS_LD_DIR=$CHS_SW/link
+CHS=$(ls -d "$GW"/.bender/git/checkouts/cheshire-*/ 2>/dev/null | head -1)
+GW_GEN="$GW/.generated"
+[ -n "$CHS" ] && [ -d "${CHS}sw" ] && [ -d "$GW_GEN" ] \
+  || { echo "GW='$GW' has no cheshire checkout or .generated" >&2; exit 1; }
+CHS_SW="${CHS}sw"
+LIBDIR="$IREE_BUILD/runtime/src/iree"
 
-HOST_LD=${HOST_LD:-$HERE/dram_host.ld}
+BUILD_DIR="${BUILD_DIR:-$HERE/build}"
+mkdir -p "$BUILD_DIR"
+HOST_LD="${HOST_LD:-$HERE/dram_host.ld}"
+OUT="$BUILD_DIR/quidditch_gemm.dram.elf"
 
-# Match Cheshire's march/mabi (newlib multilib + libcheshire ABI-compatible),
-# medany + explicit-relocs (the way cheshire/sw/sw.mk:27 builds DRAM SW).
+# Match Cheshire's march/mabi + medany/explicit-relocs (cheshire/sw/sw.mk DRAM build).
 ARCH=(-march=rv64gc_zifencei -mabi=lp64d -mstrict-align -mcmodel=medany -mexplicit-relocs)
 COMMON=(-O2 -g -ffunction-sections -fdata-sections -fno-builtin)
-
 DEFS=(-DIREE_PLATFORM_GENERIC=1 -DIREE_FILE_IO_ENABLE=0 "-DIREE_TIME_NOW_FN={ return 0; }"
  -DIREE_DEVICE_SIZE_T=uint64_t -DPRIdsz=PRIu64)
-
-INC=(-I$IREE_SRC/runtime/src -I$IREE_BUILD/runtime/src
- -I$IREE_SRC/third_party/flatcc/include -I$IREE_SRC/third_party/printf/src
- -I$PARENT -I$PARENT/transport -I$EMITC -I$HERE
- -I$GW_GEN
- -I$CHS_SW/include -I$CHS_SW/deps/printf)
-
+INC=(-I"$IREE_SRC/runtime/src" -I"$IREE_BUILD/runtime/src"
+ -I"$IREE_SRC/third_party/flatcc/include" -I"$IREE_SRC/third_party/printf/src"
+ -I"$HERE" -I"$TARGET_DIR/transport" -I"$TARGET_DIR/hal/cluster" -I"$EMITC" -I"$GW_GEN"
+ -I"$CHS_SW/include" -I"$CHS_SW/deps/printf")
 CFLAGS=("${ARCH[@]}" "${COMMON[@]}" "${DEFS[@]}" "${INC[@]}")
 
-echo "== [13.2.0] compiling cheshire bridge + HW shared region + host main =="
-$GCC "${CFLAGS[@]}" -c $HERE/cheshire_bridge.c        -o cheshire_bridge.o
-$GCC "${CFLAGS[@]}" -c $HERE/shared_region_cheshire.c -o shared_region.o
-$GCC "${CFLAGS[@]}" -c $HERE/quidditch_gemm_main.c    -o quidditch_gemm_main.o
+o() { echo "$BUILD_DIR/$1"; }
+echo "== compiling DRAM host (IREE VM), gcc $($GCC -dumpversion) =="
+$GCC "${CFLAGS[@]}" -c "$HERE/cheshire_bridge.c"                          -o "$(o cheshire_bridge.o)"
+$GCC "${CFLAGS[@]}" -c "$HERE/shared_region_cheshire.c"                  -o "$(o shared_region.o)"
+$GCC "${CFLAGS[@]}" -c "$HERE/quidditch_gemm_main.c"                     -o "$(o quidditch_gemm_main.o)"
+$GCC "${CFLAGS[@]}" -c "$EMITC/gemm_square_emitc.c"                      -o "$(o gemm_square_emitc.o)"
+$GCC "${CFLAGS[@]}" -c "$TARGET_DIR/transport/cluster_command_stream.c"  -o "$(o cluster_command_stream.o)"
+$GCC "${CFLAGS[@]}" -c "$TARGET_DIR/hal/cluster/cluster_allocator.c"      -o "$(o cluster_allocator.o)"
+$GCC "${CFLAGS[@]}" -c "$TARGET_DIR/hal/cluster/cluster_command_buffer.c" -o "$(o cluster_command_buffer.o)"
+$GCC "${CFLAGS[@]}" -c "$TARGET_DIR/hal/cluster/cluster_device.c"         -o "$(o cluster_device.o)"
+MODHAL="$IREE_SRC/runtime/src/iree/modules/hal"
+$GCC "${CFLAGS[@]}" -c "$MODHAL/module.c"                    -o "$(o modhal_module.o)"
+$GCC "${CFLAGS[@]}" -c "$MODHAL/types.c"                     -o "$(o modhal_types.o)"
+$GCC "${CFLAGS[@]}" -c "$MODHAL/debugging.c"                 -o "$(o modhal_debugging.o)"
+$GCC "${CFLAGS[@]}" -c "$MODHAL/utils/buffer_diagnostics.c" -o "$(o modhal_buffer_diag.o)"
 
-echo "== compiling EmitC native module =="
-$GCC "${CFLAGS[@]}" -c $EMITC/gemm_square_emitc.c -o gemm_square_emitc.o
-
-echo "== compiling cluster HAL + command stream (host side) =="
-$GCC "${CFLAGS[@]}" -c $PARENT/transport/cluster_command_stream.c -o cluster_command_stream.o
-$GCC "${CFLAGS[@]}" -c $PARENT/hal/cluster/cluster_allocator.c      -o cluster_allocator.o
-$GCC "${CFLAGS[@]}" -c $PARENT/hal/cluster/cluster_command_buffer.c -o cluster_command_buffer.o
-$GCC "${CFLAGS[@]}" -c $PARENT/hal/cluster/cluster_device.c         -o cluster_device.o
-
-echo "== compiling IREE HAL module =="
-MODHAL=$IREE_SRC/runtime/src/iree/modules/hal
-$GCC "${CFLAGS[@]}" -c $MODHAL/module.c                 -o modhal_module.o
-$GCC "${CFLAGS[@]}" -c $MODHAL/types.c                  -o modhal_types.o
-$GCC "${CFLAGS[@]}" -c $MODHAL/debugging.c              -o modhal_debugging.o
-$GCC "${CFLAGS[@]}" -c $MODHAL/utils/buffer_diagnostics.c -o modhal_buffer_diag.o
-
-# Only genuinely-unprovided shims: pthread no-op mutexes (newlib has no pthread)
-# and IREE-internal io file-handle symbols (never in any lib). NO libc/libm stubs.
 STUBS="$EMITC/pthread_stubs.o $EMITC/iree_io_stubs.o"
-
-CLUSTER_OBJS="cluster_command_stream.o cluster_allocator.o \
- cluster_command_buffer.o cluster_device.o \
- modhal_module.o modhal_types.o modhal_debugging.o modhal_buffer_diag.o"
-
+CLUSTER_OBJS="$(o cluster_command_stream.o) $(o cluster_allocator.o) $(o cluster_command_buffer.o) $(o cluster_device.o) $(o modhal_module.o) $(o modhal_types.o) $(o modhal_debugging.o) $(o modhal_buffer_diag.o)"
 IREE_LIBS="\
  $LIBDIR/vm/libiree_vm_impl.a \
  $LIBDIR/hal/libiree_hal_hal.a \
@@ -105,26 +93,20 @@ IREE_LIBS="\
  $LIBDIR/base/internal/libiree_base_internal_arena.a \
  $LIBDIR/base/internal/libiree_base_internal_atomic_slist.a"
 
-echo "== linking DRAM ELF (cheshire crt0 + dram_host.ld + REAL newlib/libgcc) =="
-# NO --allow-multiple-definition. Real newlib -lc provides memcpy/memset/malloc/
-# strtod; libcheshire is an archive pulled only for the UART/clint members it
-# uniquely defines (its memcpy/memset members are not pulled because newlib
-# resolves those first). Real -lm/-lgcc provide __trunctfdf2/frexp/scalbn/pow...
+echo "== linking $OUT (crt0 + ${HOST_LD##*/} + REAL newlib/libgcc) =="
 $GCC "${ARCH[@]}" -nostartfiles -Wl,--gc-sections \
-  -T$HOST_LD -Wl,-L$CHS_LD_DIR -Wl,-L$HERE \
-  $CHS_CRT0 \
-  cheshire_bridge.o shared_region.o quidditch_gemm_main.o \
-  gemm_square_emitc.o \
+  -T"$HOST_LD" -Wl,-L"$CHS_SW/link" -Wl,-L"$HERE" \
+  "$CHS_SW/lib/crt0.o" \
+  "$(o cheshire_bridge.o)" "$(o shared_region.o)" "$(o quidditch_gemm_main.o)" \
+  "$(o gemm_square_emitc.o)" \
   $CLUSTER_OBJS \
   $STUBS \
-  -Wl,--start-group $IREE_LIBS -lc -lm -lgcc $CHS_LIB -Wl,--end-group \
-  -o quidditch_gemm.dram.elf
+  -Wl,--start-group $IREE_LIBS -lc -lm -lgcc "$CHS_SW/lib/libcheshire.a" -Wl,--end-group \
+  -o "$OUT"
 
 echo "== result =="
-${PFX}size quidditch_gemm.dram.elf
-file quidditch_gemm.dram.elf
-echo "== verify ZERO absolute R_RISCV_HI20 in final ELF (DRAM reloc-safety) =="
-${PFX}objdump -dr quidditch_gemm.dram.elf 2>/dev/null | grep -c R_RISCV_HI20 || true
-echo "== entry =="
-${PFX}readelf -h quidditch_gemm.dram.elf | grep -E "Entry"
-echo "ELF: $HERE/quidditch_gemm.dram.elf"
+${PFX}size "$OUT"
+echo "== absolute R_RISCV_HI20 count (DRAM reloc-safety; must be 0) =="
+${PFX}objdump -dr "$OUT" 2>/dev/null | grep -c R_RISCV_HI20 || true
+${PFX}readelf -h "$OUT" | grep -E "Entry"
+echo "ELF: $OUT"

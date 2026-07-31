@@ -20,7 +20,7 @@
  * AxiDataWidth/8 = 8*256*8*8 = 128 KiB; the conservative cheshire_addrs.ldh
  * declares only 64 KiB but the HW + CVA6 execute/cached region is 128 KiB).
  * Everything else (.misc rodata/data, .bss incl. the VM arena, stack) stays in
- * the L2-SPM (0x70014000), which the CVA6 can load/store from and which the
+ * the L2-SPM (0x70040000), which the CVA6 can load/store from and which the
  * cluster firmware shares. Cross-region absolute references are fine (medany).
  */
 

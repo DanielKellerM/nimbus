@@ -16,7 +16,7 @@
 // a resolved ref's device-PA is recovered by mapping it and computing
 // pa = qcs_ptr_to_pa(region, mapped_ptr).
 
-#include "runtime/host/hal/cluster/cluster_command_buffer.h"
+#include "cluster_command_buffer.h"
 
 #include <assert.h>
 #include <stddef.h>
@@ -25,7 +25,7 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
-#include "runtime/host/transport/cluster_command_stream.h"
+#include "cluster_command_stream.h"
 
 #define IREE_HAL_CLUSTER_MAX_DISPATCH_BINDINGS 32
 #define IREE_HAL_CLUSTER_MAX_EXECUTABLES 64

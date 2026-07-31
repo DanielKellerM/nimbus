@@ -23,8 +23,8 @@
 #include <stdint.h>
 
 #include "iree/hal/local/executable_library.h"
-#include "runtime/host/transport/cluster_command_stream.h"
-#include "runtime/host/transport/shared_region.h"
+#include "cluster_command_stream.h"
+#include "shared_region.h"
 
 #ifdef __cplusplus
 extern "C" {

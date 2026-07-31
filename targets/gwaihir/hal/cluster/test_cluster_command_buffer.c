@@ -12,10 +12,10 @@
 #include "iree/hal/allocator.h"
 #include "iree/hal/buffer.h"
 #include "iree/hal/command_buffer.h"
-#include "runtime/host/hal/cluster/cluster_allocator.h"
-#include "runtime/host/hal/cluster/cluster_command_buffer.h"
-#include "runtime/host/transport/cluster_command_stream.h"
-#include "runtime/host/transport/shared_region.h"
+#include "cluster_allocator.h"
+#include "cluster_command_buffer.h"
+#include "cluster_command_stream.h"
+#include "shared_region.h"
 
 #define CHECK_OK(expr)                                                 \
   do {                                                                 \

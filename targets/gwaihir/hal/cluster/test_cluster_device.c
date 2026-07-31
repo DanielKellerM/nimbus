@@ -24,9 +24,9 @@
 #include "iree/hal/command_buffer.h"
 #include "iree/hal/device.h"
 #include "iree/hal/semaphore.h"
-#include "runtime/host/hal/cluster/cluster_device.h"
-#include "runtime/host/transport/cluster_command_stream.h"
-#include "runtime/host/transport/shared_region.h"
+#include "cluster_device.h"
+#include "cluster_command_stream.h"
+#include "shared_region.h"
 
 #define CHECK_OK(expr)                                                 \
   do {                                                                 \

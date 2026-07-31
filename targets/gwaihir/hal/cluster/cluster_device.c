@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "runtime/host/hal/cluster/cluster_device.h"
+#include "cluster_device.h"
 
 #include <pthread.h>
 #include <stddef.h>
@@ -11,10 +11,10 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
-#include "runtime/host/hal/cluster/cluster_allocator.h"
-#include "runtime/host/hal/cluster/cluster_command_buffer.h"
-#include "runtime/host/transport/cluster_command_stream.h"
-#include "runtime/host/transport/shared_region.h"
+#include "cluster_allocator.h"
+#include "cluster_command_buffer.h"
+#include "cluster_command_stream.h"
+#include "shared_region.h"
 
 #ifdef QCS_DUMP_GOLDEN
 #include "hostio.h"  // Phase-0 golden dump only: UART host_puts/host_puthex64/_write

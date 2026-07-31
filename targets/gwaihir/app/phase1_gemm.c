@@ -46,10 +46,10 @@
 #include "iree/hal/device.h"
 #include "iree/hal/local/executable_library.h"
 #include "iree/hal/semaphore.h"
-#include "runtime/host/firmware/cluster_replay.h"
-#include "runtime/host/hal/cluster/cluster_device.h"
-#include "runtime/host/transport/cluster_command_stream.h"
-#include "runtime/host/transport/shared_region.h"
+#include "cluster_replay.h"
+#include "cluster_device.h"
+#include "cluster_command_stream.h"
+#include "shared_region.h"
 
 #define REGION_SIZE (1u << 20)  // 1 MiB device DRAM
 
