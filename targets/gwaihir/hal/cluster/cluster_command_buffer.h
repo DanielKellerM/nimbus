@@ -24,7 +24,7 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
-#include "runtime/host/transport/shared_region.h"
+#include "shared_region.h"
 
 #ifdef __cplusplus
 extern "C" {

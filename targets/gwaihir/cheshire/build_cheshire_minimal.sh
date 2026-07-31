@@ -1,72 +1,67 @@
 #!/usr/bin/env bash
-# MINIMAL host build (the "size fix"): the IREE host VM is excised. Links only
-# the QCS transport + Cheshire bridge + the hand-written dispatch driver, so the
-# host .text drops from 137.6 KiB (VM, DRAM-resident) to ~10-15 KiB, resident in
-# the 128 KiB Cheshire SPM via hybrid.ld (text->SPM, data->L2-SPM).
-#
-# Compare build_cheshire_dram.sh: this DROPS gemm_square_emitc.o, the whole
-# cluster HAL (cluster_allocator/command_buffer/device.o), modhal_*.o, the
-# pthread/io stubs, and the entire $IREE_LIBS group (vm/hal/base/threading/...).
-# Kept: cheshire_bridge.o (_write/_sbrk), shared_region.o (HW L2-SPM region +
-# doorbell), cluster_command_stream.o (qcs_writer). Newlib -lc for memset only.
-#
-# Output: quidditch_gemm_min.elf. Default link is hybrid.ld (text->Cheshire SPM
-# 0x10000000, an executable+cached region; data/bss->L2-SPM 0x70040000). Set
-# HOST_LD=dram_host.ld to A/B the DRAM path.
+# Minimal QCS host build (the "size fix"): links only the QCS transport + Cheshire
+# bridge + the hand-written dispatch driver -- no IREE VM/HAL. text -> Cheshire SPM,
+# data/bss -> L2-SPM via hybrid.ld (generated here from the SoC addrmap). Output:
+# quidditch_gemm_min.elf. Set HOST_LD=<ld> to A/B a different link script.
 set -euo pipefail
 
-RV=/usr/pack/riscv-1.0-kgf/riscv64-gcc-13.2.0/bin
-PFX=$RV/riscv64-unknown-elf-
-GCC=${PFX}gcc
+usage() {
+  cat >&2 <<EOF
+usage: GW=<gwaihir build tree> [RV=<bin>] [BUILD_DIR=<dir>] [HOST_LD=<ld>] ${0##*/}
+  GW         gwaihir build tree with .bender (cheshire checkout) + .generated (addrmap)   [required]
+  RV         riscv64 gcc bin dir   [default: \$CHS_SW_GCC_BINROOT, else gcc-12.2.0 to match libcheshire's LTO]
+  BUILD_DIR  .o/.elf output dir     [default: <script dir>/build]
+  HOST_LD    link script           [default: the hybrid.ld generated from the addrmap]
+EOF
+  exit 2
+}
 
-IREE_SRC=/home/dankeller/Projects/Quidditch/iree
-PARENT=/scratch/dankeller/snitch-compiler/iree-rv64-host
-HERE=$PARENT/cheshire
-cd "$HERE"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this repo's cheshire host sources
+TARGET_DIR="$(dirname "$HERE")"                         # targets/gwaihir (transport/ lives here)
 
-GW=${GW:-$(dirname "$IREE_SRC")/.gwaihir}
-CHS=$GW/.bender/git/checkouts/cheshire-09830518097f85c0
-GW_GEN=$GW/.generated
+RV="${RV:-${CHS_SW_GCC_BINROOT:-/usr/pack/riscv-1.0-kgf/riscv64-gcc-12.2.0/bin}}"
+PFX="$RV/riscv64-unknown-elf-"
+GCC="${PFX}gcc"
+[ -x "$GCC" ] || { echo "no riscv gcc at '$GCC' -- set RV" >&2; exit 1; }
 
-CHS_SW=$CHS/sw
-CHS_CRT0=$CHS_SW/lib/crt0.o
-CHS_LIB=$CHS_SW/lib/libcheshire.a
-CHS_LD_DIR=$CHS_SW/link
+: "${GW:?set GW to the gwaihir build tree (has .bender + .generated)}" || usage
+CHS=$(ls -d "$GW"/.bender/git/checkouts/cheshire-*/ 2>/dev/null | head -1)
+GW_GEN="$GW/.generated"
+[ -n "$CHS" ] && [ -d "${CHS}sw" ] && [ -d "$GW_GEN" ] \
+  || { echo "GW='$GW' has no cheshire checkout or .generated" >&2; exit 1; }
+CHS_SW="${CHS}sw"
 
-HOST_LD=${HOST_LD:-$HERE/hybrid.ld}
+BUILD_DIR="${BUILD_DIR:-$HERE/build}"
+mkdir -p "$BUILD_DIR"
+HOST_LD="${HOST_LD:-$BUILD_DIR/hybrid.ld}"
+OUT="$BUILD_DIR/quidditch_gemm_min.elf"
 
 ARCH=(-march=rv64gc_zifencei -mabi=lp64d -mstrict-align -mcmodel=medany -mexplicit-relocs)
 COMMON=(-O2 -g -ffunction-sections -fdata-sections -fno-builtin)
-
-# No IREE VM/HAL: only the transport headers + Cheshire includes are needed.
-INC=(-I$PARENT -I$PARENT/transport -I$HERE -I$GW_GEN
-     -I$CHS_SW/include -I$CHS_SW/deps/printf)
-
+INC=(-I"$HERE" -I"$TARGET_DIR/transport" -I"$GW_GEN" -I"$CHS_SW/include" -I"$CHS_SW/deps/printf")
 CFLAGS=("${ARCH[@]}" "${COMMON[@]}" "${INC[@]}")
 
-echo "== [13.2.0] compiling minimal host (no IREE) =="
-$GCC "${CFLAGS[@]}" -c $HERE/cheshire_bridge.c               -o cheshire_bridge.o
-$GCC "${CFLAGS[@]}" -c $HERE/shared_region_cheshire.c        -o shared_region.o
-$GCC "${CFLAGS[@]}" -c $PARENT/transport/cluster_command_stream.c -o cluster_command_stream.o
-$GCC "${CFLAGS[@]}" -c $HERE/quidditch_gemm_minimal_main.c   -o quidditch_gemm_minimal_main.o
+echo "== compiling minimal host (no IREE), gcc $($GCC -dumpversion) =="
+$GCC "${CFLAGS[@]}" -c "$HERE/cheshire_bridge.c"                        -o "$BUILD_DIR/cheshire_bridge.o"
+$GCC "${CFLAGS[@]}" -c "$HERE/shared_region_cheshire.c"                -o "$BUILD_DIR/shared_region.o"
+$GCC "${CFLAGS[@]}" -c "$TARGET_DIR/transport/cluster_command_stream.c" -o "$BUILD_DIR/cluster_command_stream.o"
+$GCC "${CFLAGS[@]}" -c "$HERE/quidditch_gemm_minimal_main.c"           -o "$BUILD_DIR/quidditch_gemm_minimal_main.o"
 
 # Generate the hybrid link script from the SoC addrmap (single source of truth with the firmware).
-if [ "$HOST_LD" = "$HERE/hybrid.ld" ]; then
+if [ "$HOST_LD" = "$BUILD_DIR/hybrid.ld" ]; then
   $GCC -E -P -x c "-I$GW_GEN" "$HERE/hybrid.ld.in" -o "$HOST_LD"
 fi
 
-echo "== linking minimal ELF (crt0 + $HOST_LD + newlib) =="
+echo "== linking $OUT (crt0 + ${HOST_LD##*/} + newlib) =="
 $GCC "${ARCH[@]}" -nostartfiles -Wl,--gc-sections \
-  -T$HOST_LD -Wl,-L$CHS_LD_DIR -Wl,-L$HERE \
-  $CHS_CRT0 \
-  cheshire_bridge.o shared_region.o cluster_command_stream.o \
-  quidditch_gemm_minimal_main.o \
-  -Wl,--start-group -lc -lgcc $CHS_LIB -Wl,--end-group \
-  -o quidditch_gemm_min.elf
+  -T"$HOST_LD" -Wl,-L"$CHS_SW/link" -Wl,-L"$HERE" \
+  "$CHS_SW/lib/crt0.o" \
+  "$BUILD_DIR/cheshire_bridge.o" "$BUILD_DIR/shared_region.o" \
+  "$BUILD_DIR/cluster_command_stream.o" "$BUILD_DIR/quidditch_gemm_minimal_main.o" \
+  -Wl,--start-group -lc -lgcc "$CHS_SW/lib/libcheshire.a" -Wl,--end-group \
+  -o "$OUT"
 
 echo "== result =="
-${PFX}size quidditch_gemm_min.elf
-${PFX}readelf -h quidditch_gemm_min.elf | grep -E "Entry"
-echo "== .text/.bss placement (must be chsspm 0x10000000 / l2data 0x70040000) =="
-${PFX}readelf -S quidditch_gemm_min.elf | grep -E "\.text|\.bss|\.misc|Name" | head
-echo "ELF: $HERE/quidditch_gemm_min.elf"
+${PFX}size "$OUT"
+${PFX}readelf -hS "$OUT" | grep -E "Entry|\.text|\.bss|\.misc|Name"
+echo "ELF: $OUT"

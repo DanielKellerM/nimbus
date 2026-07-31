@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "runtime/host/hal/cluster/cluster_allocator.h"
+#include "cluster_allocator.h"
 
 #include <inttypes.h>
 #include <stddef.h>

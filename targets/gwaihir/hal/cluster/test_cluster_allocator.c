@@ -11,8 +11,8 @@
 #include "iree/base/allocator.h"
 #include "iree/hal/allocator.h"
 #include "iree/hal/buffer.h"
-#include "runtime/host/hal/cluster/cluster_allocator.h"
-#include "runtime/host/transport/shared_region.h"
+#include "cluster_allocator.h"
+#include "shared_region.h"
 
 #define CHECK_OK(expr)                                                     \
   do {                                                                     \

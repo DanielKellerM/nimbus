@@ -28,9 +28,9 @@
 
 #include "gemm_square_emitc.h"
 #include "hostio.h"
-#include "runtime/host/hal/cluster/cluster_device.h"
-#include "runtime/host/transport/cluster_command_stream.h"
-#include "runtime/host/transport/shared_region.h"
+#include "cluster_device.h"
+#include "cluster_command_stream.h"
+#include "shared_region.h"
 
 //===----------------------------------------------------------------------===//
 // Host VM bookkeeping arena (NOT the L2-SPM shared region).

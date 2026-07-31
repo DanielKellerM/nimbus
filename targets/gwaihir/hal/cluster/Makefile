@@ -9,7 +9,7 @@ IREE_LIBS := $(shell find $(HOSTBUILD) -name 'libiree_*.a')
 # in tracing.h), so we run -Wall -Wextra without -Werror here.
 CFLAGS ?= -std=c11 -Wall -Wextra -g
 SAN ?= -fsanitize=address
-CPPFLAGS := -I$(SRC)/iree/runtime/src -I$(HOSTBUILD)/runtime/src -I$(SRC)
+CPPFLAGS := -I$(SRC)/iree/runtime/src -I$(HOSTBUILD)/runtime/src -I$(SRC) -I../../transport
 LDLIBS := -Wl,--start-group $(IREE_LIBS) -Wl,--end-group -lpthread -ldl -lm
 
 TRANSPORT := ../../transport/shared_region.c ../../transport/cluster_command_stream.c

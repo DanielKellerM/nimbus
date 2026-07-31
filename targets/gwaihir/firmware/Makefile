@@ -13,14 +13,14 @@ SRC := $(abspath ../../..)
 # IREE's headers are not -Werror-clean under this clang, so no -Werror here.
 CFLAGS ?= -std=c11 -Wall -Wextra -g
 SAN ?= -fsanitize=address
-CPPFLAGS := -I$(SRC)/iree/runtime/src -I$(SRC)/runtime/runtime/src \
+CPPFLAGS := -I$(SRC)/iree/runtime/src -I$(SRC)/runtime/runtime/src \ -I../transport
             -I$(HOSTBUILD)/runtime/src -I$(SRC)
 # Header-only ABI: no IREE archives needed. Keep the libm/pthread/dl trio for
 # parity with the sibling Makefile in case a future kernel needs them.
 LDLIBS := -lpthread -ldl -lm
 
-TRANSPORT := $(SRC)/runtime/host/transport/shared_region.c \
-             $(SRC)/runtime/host/transport/cluster_command_stream.c
+TRANSPORT := ../transport/shared_region.c \
+             ../transport/cluster_command_stream.c
 
 SRCS := test_cluster_replay.c cluster_replay.c $(TRANSPORT)
 
