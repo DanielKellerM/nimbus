@@ -57,8 +57,14 @@ extern "C" {
 #endif
 // C linkage: the kernel object exports an unmangled C symbol; this firmware TU
 // is compiled with -x c++, so the declaration must be extern "C".
+// The library-query symbol name is derived from the compiled module; default is
+// gemm_square. Override with -DQCS_KERNEL_LIBRARY_QUERY=<symbol> for another model
+// (e.g. quidditch_mlp_linked_quidditch_library_query for the MLP front-door).
+#ifndef QCS_KERNEL_LIBRARY_QUERY
+#define QCS_KERNEL_LIBRARY_QUERY quidditch_gemm64_dispatch_0_library_query
+#endif
 extern const iree_hal_executable_library_header_t**
-quidditch_gemm64_dispatch_0_library_query(
+QCS_KERNEL_LIBRARY_QUERY(
     iree_hal_executable_library_version_t max_version,
     const iree_hal_executable_environment_v0_t* environment);
 #ifdef __cplusplus
@@ -114,7 +120,7 @@ static void gw_register_kernels(qcs_replay_table_t* table) {
   // max_version is the highest library ABI the caller (this firmware) supports;
   // the v0.6 library_query returns NULL when it is < 6 (VERSION_0_6).
   const iree_hal_executable_library_header_t** lib_hdr =
-      quidditch_gemm64_dispatch_0_library_query(
+      QCS_KERNEL_LIBRARY_QUERY(
           /*max_version=*/QUIDDITCH_EXECUTABLE_LIBRARY_VERSION_LATEST,
           /*environment=*/NULL);
   if (lib_hdr &&
@@ -163,10 +169,10 @@ int main() {
   // block is a single shared L2-SPM word; gate to cluster 0 so the 16 clusters
   // don't race on it (same rationale as qcs_replay.c qcs_dbg_phase).
   if (snrt_cluster_idx() == 0) {
-    volatile uint64_t* _wake_dbg =
+    volatile uint64_t* wake_dbg =
         (volatile uint64_t*)(region.base + QCS_DEBUG_BLOCK_OFFSET);
-    _wake_dbg[0] = QCS_DBG_MAGIC;
-    _wake_dbg[1] = 99u;
+    wake_dbg[0] = QCS_DBG_MAGIC;
+    wake_dbg[1] = QCS_DBG_WAKE_REACHED;  // host-visible "cluster 0 passed the boot barrier"
   }
 
   const qcs_job_descriptor_t* job =

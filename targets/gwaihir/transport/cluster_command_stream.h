@@ -44,6 +44,7 @@ extern "C" {
 // offset + magic are canonical here rather than re-#defined per file.
 #define QCS_DEBUG_BLOCK_OFFSET (QCS_JOB_DESCRIPTOR_OFFSET + 0x100u)
 #define QCS_DBG_MAGIC 0x51474442ull  // "QGDB"
+#define QCS_DBG_WAKE_REACHED 99u     // dbg[1]: cluster 0 passed the boot barrier into main()
 
 typedef enum qcs_cmd_type_e {
   QCS_CMD_DISPATCH = 1,  // replay a dispatch onto the compute cores
