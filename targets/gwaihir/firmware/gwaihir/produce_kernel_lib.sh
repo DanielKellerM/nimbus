@@ -38,8 +38,11 @@ mlir="${1:-$quidditch_root/runtime/samples/gemm_square/gemm_square_4x4.mlir}"
 [ -f "$mlir" ] || { echo "ERROR: kernel source not found: $mlir" >&2; exit 1; }
 outdir="${2:-${KERNEL_LIB_DIR:-$nimbus_root/.gwaihir-kernel-lib}}"
 mkdir -p "$outdir"
-obj="$outdir/gemm_square_kernel.o"
-lib="$outdir/libgemm_square_kernel.a"
+# Kernel name (drives the .a/.o filenames). Default gemm_square; set KERNEL_NAME for
+# another model (e.g. KERNEL_NAME=mlp -> libmlp_kernel.a).
+name="${KERNEL_NAME:-gemm_square}"
+obj="$outdir/${name}_kernel.o"
+lib="$outdir/lib${name}_kernel.a"
 ar="${LLVM_AR:-$tcr/bin/llvm-ar}"; [ -x "$ar" ] || ar=$(command -v llvm-ar)
 
 echo "producing $lib"
@@ -54,11 +57,13 @@ echo "           xdsl-opt=$xdsl  toolchain=$tcr"
   --iree-quidditch-static-library-output-path="$obj"
 "$ar" rcs "$lib" "$obj"
 
-# Gate: the query symbol + the $xdsl_kernel microkernels (absent = a scalar xdsl-opt fallback).
-"$tcr/bin/llvm-nm" "$lib" 2>/dev/null | grep -q 'quidditch_gemm64_dispatch_0_library_query' \
-  || { echo "ERROR: produced .a lacks quidditch_gemm64_dispatch_0_library_query" >&2; exit 1; }
+# Gate: a library-query symbol (model-derived name) + the $xdsl_kernel microkernels
+# (absent = a scalar xdsl-opt fallback). The detected query is what the firmware queries.
+query=$("$tcr/bin/llvm-nm" "$lib" 2>/dev/null | grep -oE 'quidditch_[a-z0-9_]+_library_query' | head -1)
+[ -n "$query" ] || { echo "ERROR: produced .a has no quidditch_*_library_query symbol" >&2; exit 1; }
 kern=$("$tcr/bin/llvm-nm" "$lib" 2>/dev/null | grep -c 'xdsl_kernel' || true)
 [ "${kern:-0}" -gt 0 ] || { echo "ERROR: no \$xdsl_kernel microkernels -- xdsl-opt fell back to scalar (wrong .venv?)" >&2; exit 1; }
-echo "  OK: \$xdsl_kernel x$kern (SSR/FREP streaming present)"
-echo "KERNEL_LIB_DIR=$outdir"
-echo "  wire it in: KERNEL_LIB_DIR=$outdir ./link_into_gwaihir_tree.sh"
+echo "  OK: query=$query, \$xdsl_kernel x$kern (SSR/FREP streaming present)"
+echo "KERNEL_LIB_DIR=$outdir  KERNEL_LIB=lib${name}_kernel.a  QUERY=$query"
+echo "  wire it in:  KERNEL_LIB_DIR=$outdir ./link_into_gwaihir_tree.sh"
+echo "  build qcs_replay for it:  make ... QCS_KERNEL_LIB=lib${name}_kernel.a QCS_KERNEL_LIBRARY_QUERY=$query"
