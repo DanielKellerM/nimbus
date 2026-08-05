@@ -21,8 +21,9 @@ are device-specific.
   structs, field-for-field identical to `iree/hal/local/executable_library.h`
   (verified) so a real iree+xdsl kernel.o links + is called with the exact
   layout. Kept dependency-free so the rv32 build doesn't pull in `iree/base/*`.
-- `main.c` — entry: L2-SPM region setup, kernel registration (STUB today), the
-  replay call, and the Phase-0 completion handshake into the descriptor.
+- `main.c` — entry: L2-SPM region setup, kernel registration (the compiled
+  iree+xdsl library via the library-query path; stub only behind
+  `QCS_USE_STUB_KERNEL`), the replay call, and the completion handshake.
 - `app.mk` — gwaihir snitch-app build fragment.
 
 `cluster_command_stream.{h,c}` (the QCS ABI + reader) are NOT duplicated here —
@@ -45,11 +46,14 @@ make qcs_replay        # or `make sn-apps`  (NOT SN_BUILD_APPS=ON — name colli
 → `build/qcs_replay.elf` (rv32, loads at L2-SPM base `0x7000_0000`). Verified:
 compiles + links `-Werror`, zero undefined refs.
 
-## Status / next
-The real iree+xdsl `gemm64` kernel links via the SPLIT `lib/` (registered in
-`gw_register_kernels` through the library-query path); the stub survives only
-behind `QCS_USE_STUB_KERNEL`. The host half runs on RTL (CVA6 boots from
-LLC-cached DRAM). Current blocker is downstream: the cluster cores jump to `PC=0`
-— a wake / entry-vector issue (the host must seed+wake every cluster, not just
-cluster 0). Next: resolve that, then stage L2 bindings into TCDM per tiling.
-See [`../../../../docs/host-device-split-phase2.md`](../../../../docs/host-device-split-phase2.md).
+## Status
+This firmware runs headless on the full 16-cluster gwaihir SoC RTL (`PRELMODE=5`,
+no CVA6 host): a 2-layer PyTorch MLP completes `done=144/144 fail=0` with all 256
+output elements matching the torch golden to f64 last-bit (`max_abs_err 1.7e-16`).
+The compiled iree+xdsl kernel registers via the library-query path (stub only behind
+`QCS_USE_STUB_KERNEL`). The earlier `PC=0` wake issue was resolved (the host seeds +
+wakes every cluster, not just cluster 0); a 16-cluster shared-table registration race
+was fixed by gating `gw_register_kernels` to cluster 0's DM core + a global barrier.
+
+For the full model → run pipeline (front-door, `produce_kernel_lib.sh`,
+`gen_qcs_offload_image.py`, the co-sim invocation) see [`../RUNBOOK.md`](../RUNBOOK.md).

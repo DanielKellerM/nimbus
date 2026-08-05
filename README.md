@@ -61,8 +61,20 @@ git submodule update --init --recursive          # fetches quidditch + gwaihir (
 git -C quidditch/iree apply "$PWD/targets/gwaihir/patches/iree-verify-off.patch"
 
 targets/gwaihir/setup-gwaihir.sh                 # patch soc/ + bender checkout + wire firmware
-make -C targets/gwaihir/soc sw                   # -> sw/snitch/apps/qcs_replay/build/qcs_replay.elf
 ```
+
+The `qcs_replay` firmware links a **compiled kernel library**, so build that first (needs a
+built Quidditch — see `quidditch/README.md`), then build the target explicitly:
+
+```
+QUIDDITCH_BUILD_DIR=<your quidditch build> targets/gwaihir/firmware/gwaihir/produce_kernel_lib.sh
+KERNEL_LIB_DIR=$PWD/.gwaihir-kernel-lib targets/gwaihir/firmware/gwaihir/link_into_gwaihir_tree.sh
+make -C targets/gwaihir/soc qcs_replay           # NOT `make sw` (that omits qcs_replay)
+#   -> sw/snitch/apps/qcs_replay/build/qcs_replay.elf
+```
+
+**To run a model end-to-end** (PyTorch → headless SoC, with the offload image and the
+co-sim invocation), follow **[`targets/gwaihir/RUNBOOK.md`](targets/gwaihir/RUNBOOK.md)**.
 
 The firmware sources (Nimbus) and the executable-ABI header (the `quidditch`
 submodule) are wired through two roots — `NIMBUS_ROOT` and
