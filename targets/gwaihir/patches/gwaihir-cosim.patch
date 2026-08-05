@@ -1,3 +1,32 @@
+diff --git a/Makefile b/Makefile
+index db76e55..c903d8c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -107,9 +107,23 @@ SN_GEN_DIR = $(GW_GEN_DIR)
+ include $(SN_ROOT)/make/common.mk
+ include $(SN_ROOT)/make/rtl.mk
+ 
+-$(SN_CFG): SN_CLUSTERS = $(shell $(FLOO_GEN) query -c $(FLOO_CFG) endpoints.cluster.num 2>/dev/null)
++# Snitch cluster cfg apertures single-sourced from the NoC yaml (the ONE place the
++# cluster/L2-SPM/DRAM bases live) -- extends the nr_clusters query+sed. sed replaces
++# only the hex literal after each key, preserving the JSON5 trailing commas.
++$(SN_CFG): SN_CLUSTERS  = $(shell $(FLOO_GEN) query -c $(FLOO_CFG) endpoints.cluster.num 2>/dev/null)
++$(SN_CFG): SN_CL_BASE   = $(shell printf '0x%x' $$($(FLOO_GEN) query -c $(FLOO_CFG) 'endpoints.cluster.addr_range[0].base' 2>/dev/null))
++$(SN_CFG): SN_CL_OFFSET = $(shell printf '0x%x' $$($(FLOO_GEN) query -c $(FLOO_CFG) 'endpoints.cluster.addr_range[0].size' 2>/dev/null))
++$(SN_CFG): SN_L2_BASE   = $(shell printf '0x%x' $$($(FLOO_GEN) query -c $(FLOO_CFG) 'endpoints.l2_spm.addr_range[0].base' 2>/dev/null))
++$(SN_CFG): SN_L2_LEN    = $(shell printf '0x%x' $$($(FLOO_GEN) query -c $(FLOO_CFG) 'endpoints.l2_spm.num * endpoints.l2_spm.addr_range[0].size' 2>/dev/null))
++$(SN_CFG): SN_DRAM_BASE = $(shell printf '0x%x' $$($(FLOO_GEN) query -c $(FLOO_CFG) 'endpoints.cheshire.addr_range[1].start' 2>/dev/null))
++$(SN_CFG): SN_DRAM_LEN  = $(shell printf '0x%x' $$($(FLOO_GEN) query -c $(FLOO_CFG) 'endpoints.cheshire.addr_range[1].end - endpoints.cheshire.addr_range[1].start' 2>/dev/null))
+ $(SN_CFG): $(FLOO_CFG)
++	@command -v $(FLOO_GEN) >/dev/null || { echo "ERROR: $(FLOO_GEN) not on PATH (activate the floogen venv)"; exit 1; }
+ 	@sed -i 's/nr_clusters: .*/nr_clusters: $(SN_CLUSTERS),/' $@
++	@sed -i 's/\(cluster_base_addr:[[:space:]]*\)0x[0-9a-fA-F]*/\1$(SN_CL_BASE)/' $@
++	@sed -i 's/\(cluster_base_offset:[[:space:]]*\)0x[0-9a-fA-F]*/\1$(SN_CL_OFFSET)/' $@
++	@sed -i '/name: "l2spm"/,/}/{ s/\(address:[[:space:]]*\)0x[0-9a-fA-F]*/\1$(SN_L2_BASE)/; s/\(length:[[:space:]]*\)0x[0-9a-fA-F]*/\1$(SN_L2_LEN)/ }' $@
++	@sed -i '/name: "dram"/,/}/{ s/\(address:[[:space:]]*\)0x[0-9a-fA-F]*/\1$(SN_DRAM_BASE)/; s/\(length:[[:space:]]*\)0x[0-9a-fA-F]*/\1$(SN_DRAM_LEN)/ }' $@
+ 
+ .PHONY: sn-hw-clean sn-hw-all
+ 
 diff --git a/cfg/mini_gwaihir_noc.yml b/cfg/mini_gwaihir_noc.yml
 index d6af7be..4681ebc 100644
 --- a/cfg/mini_gwaihir_noc.yml
@@ -36,6 +65,19 @@ index d6af7be..4681ebc 100644
      sbr_port_protocol:
        - "narrow_out"
        - "wide_out"
+diff --git a/cfg/snitch_cluster.json b/cfg/snitch_cluster.json
+index dee9da3..cb17b91 100644
+--- a/cfg/snitch_cluster.json
++++ b/cfg/snitch_cluster.json
+@@ -85,7 +85,7 @@
+         {
+             name: "l2spm",
+             address: 0x70000000,
+-            length: 0x10000000,
++            length: 0x200000,
+             cacheable: true
+         },
+         {
 diff --git a/hw/cheshire_tile.sv b/hw/cheshire_tile.sv
 index 0b911f0..2c8e3de 100644
 --- a/hw/cheshire_tile.sv
@@ -686,6 +728,48 @@ index 0000000..1cafe41
 +
 +  return sum;
 +}
+diff --git a/sw/snitch/runtime/impl/.gitignore b/sw/snitch/runtime/impl/.gitignore
+index 65e1b2d..1ee3f79 100644
+--- a/sw/snitch/runtime/impl/.gitignore
++++ b/sw/snitch/runtime/impl/.gitignore
+@@ -7,3 +7,4 @@ snitch_cluster_raw_addrmap.h
+ snitch_cluster_peripheral.h
+ snitch_cluster_peripheral_addrmap.h
+ snitch_cluster_addrmap.rdl
++memory.ld
+diff --git a/sw/snitch/runtime/impl/memory.ld b/sw/snitch/runtime/impl/memory.ld
+deleted file mode 100644
+index 6f646d6..0000000
+--- a/sw/snitch/runtime/impl/memory.ld
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/* Copyright 2025 ETH Zurich and University of Bologna. */
+-/* Licensed under the Apache License, Version 2.0, see LICENSE for details. */
+-/* SPDX-License-Identifier: Apache-2.0 */
+-
+-MEMORY
+-{
+-    L3 (rwxa) : ORIGIN = 0x70000000, LENGTH = 0x10000000
+-}
+diff --git a/sw/snitch/runtime/impl/memory.ld.in b/sw/snitch/runtime/impl/memory.ld.in
+new file mode 100644
+index 0000000..ae84ffc
+--- /dev/null
++++ b/sw/snitch/runtime/impl/memory.ld.in
+@@ -0,0 +1,13 @@
++/* Copyright 2025 ETH Zurich and University of Bologna. */
++/* Licensed under the Apache License, Version 2.0, see LICENSE for details. */
++/* SPDX-License-Identifier: Apache-2.0 */
++
++/* Snitch L3 region, single-sourced from the generated SoC addrmap (cpp-included,
++   like cheshire/hybrid.ld.in) instead of a hardcoded 0x70000000 / 0x10000000 whose
++   LENGTH was 128x the real GW_L2_SPM_TOTAL_SIZE. On gwaihir L3 is the L2-SPM. */
++#include "gw_raw_addrmap.h"
++
++MEMORY
++{
++    L3 (rwxa) : ORIGIN = GW_L2_SPM_BASE_ADDR(0), LENGTH = GW_L2_SPM_TOTAL_SIZE
++}
 diff --git a/sw/snitch/runtime/impl/snitch_cluster_start.h b/sw/snitch/runtime/impl/snitch_cluster_start.h
 index f791a51..49ce967 100644
 --- a/sw/snitch/runtime/impl/snitch_cluster_start.h
@@ -703,7 +787,7 @@ index f791a51..49ce967 100644
  #define SNRT_CRT0_POST_BARRIER
  #define SNRT_CRT0_EXIT
 diff --git a/sw/sw.mk b/sw/sw.mk
-index f5ae51c..763804b 100644
+index f5ae51c..21481b2 100644
 --- a/sw/sw.mk
 +++ b/sw/sw.mk
 @@ -41,6 +41,7 @@ SN_TESTS_INCDIRS  = $(SN_ROOT)/sw/kernels/blas
@@ -714,7 +798,7 @@ index f5ae51c..763804b 100644
  SN_APPS += $(GW_SNITCH_SW_DIR)/apps/gemm
  SN_APPS += $(GW_SNITCH_SW_DIR)/apps/axpy
  SN_APPS += $(SN_ROOT)/sw/kernels/dnn/flashattention_2
-@@ -48,6 +49,7 @@ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/fused_concat_linear
+@@ -48,12 +49,18 @@ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/fused_concat_linear
  SN_APPS += $(GW_SNITCH_SW_DIR)/apps/mha
  SN_APPS += $(GW_SNITCH_SW_DIR)/apps/summa_gemm
  SN_APPS += $(GW_SNITCH_SW_DIR)/apps/power_benchmarks
@@ -722,6 +806,17 @@ index f5ae51c..763804b 100644
  
  SN_TESTS = $(wildcard $(GW_SNITCH_SW_DIR)/tests/*.c)
  
+ $(GW_GEN_DIR)/gw_noc_cfg.h: $(UTIL_DIR)/mako_render.py $(FLOO_CFG)
+ 	 $< -t $(SN_RUNTIME_SRCDIR)/gw_noc_cfg.h.tpl -y $(FLOO_CFG) -o $@
+ 
++# Snitch L3 (=L2-SPM) linker region, single-sourced from the generated addrmap
++# (cpp-included like cheshire/hybrid.ld.in) -- was a hardcoded 0x70000000/0x10000000.
++$(SN_RUNTIME_SRCDIR)/memory.ld: $(SN_RUNTIME_SRCDIR)/memory.ld.in $(GW_GEN_DIR)/gw_raw_addrmap.h
++	gcc -E -P -x c -I$(GW_GEN_DIR) $< -o $@
++
+ include $(SN_ROOT)/make/sw.mk
+ 
+ ##############
 diff --git a/target/sim/include/tb_gwaihir_tasks.svh b/target/sim/include/tb_gwaihir_tasks.svh
 index 2548d8e..a92e7de 100644
 --- a/target/sim/include/tb_gwaihir_tasks.svh
