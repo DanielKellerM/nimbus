@@ -59,7 +59,7 @@ echo "           xdsl-opt=$xdsl  toolchain=$tcr"
 
 # Gate: a library-query symbol (model-derived name) + the $xdsl_kernel microkernels
 # (absent = a scalar xdsl-opt fallback). The detected query is what the firmware queries.
-query=$("$tcr/bin/llvm-nm" "$lib" 2>/dev/null | grep -oE 'quidditch_[a-z0-9_]+_library_query' | head -1)
+query=$("$tcr/bin/llvm-nm" "$lib" 2>/dev/null | grep -oE 'quidditch_[a-z0-9_]+_library_query' | head -1 || true)
 [ -n "$query" ] || { echo "ERROR: produced .a has no quidditch_*_library_query symbol" >&2; exit 1; }
 kern=$("$tcr/bin/llvm-nm" "$lib" 2>/dev/null | grep -c 'xdsl_kernel' || true)
 [ "${kern:-0}" -gt 0 ] || { echo "ERROR: no \$xdsl_kernel microkernels -- xdsl-opt fell back to scalar (wrong .venv?)" >&2; exit 1; }

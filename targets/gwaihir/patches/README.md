@@ -10,7 +10,10 @@ the co-sim bring-up mods on top of upstream: the 2×2/mini NoC cfg
 `hw/cluster_tile.sv`, `hw/gwaihir_pkg.sv`, `hw/gwaihir_top.sv`, `hw/mem_tile.sv`), the
 phase-2 testbench (`target/sim/{src/tb_gwaihir_top.sv,include/tb_gwaihir_tasks.svh,
 src/fixture_gwaihir_top.sv}` + the `vcs`/`vsim` `OFFLOAD_IMAGE` plusarg), the snitch
-start shim, `sw/sw.mk`, and the cheshire seed/offload test hosts. The testbench
+start shim, `sw/sw.mk`, the addrmap/linker single-sourcing (the `Makefile` `SN_CFG`
+recipe deriving the cluster/L2-SPM/DRAM apertures from the NoC yaml, `cfg/snitch_cluster.json`,
+and `sw/snitch/runtime/impl/memory.ld` → `memory.ld.in` deriving ORIGIN/LENGTH from
+`gw_raw_addrmap.h`), and the cheshire seed/offload test hosts. The testbench
 carries all six preload arms: 0 JTAG · 1 serial-link · 2 UART · 3 hybrid host ·
 4 DRAM host · 5 headless offload (PRELMODE=5, no host). HW deps
 (cheshire/cva6/snitch_cluster) come from `soc/Bender.lock` via `bender checkout`, not

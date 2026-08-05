@@ -1,8 +1,8 @@
 diff --git a/Makefile b/Makefile
-index db76e55..c903d8c 100644
+index db76e55..2cb0759 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -107,9 +107,23 @@ SN_GEN_DIR = $(GW_GEN_DIR)
+@@ -107,9 +107,24 @@ SN_GEN_DIR = $(GW_GEN_DIR)
  include $(SN_ROOT)/make/common.mk
  include $(SN_ROOT)/make/rtl.mk
  
@@ -19,6 +19,7 @@ index db76e55..c903d8c 100644
 +$(SN_CFG): SN_DRAM_LEN  = $(shell printf '0x%x' $$($(FLOO_GEN) query -c $(FLOO_CFG) 'endpoints.cheshire.addr_range[1].end - endpoints.cheshire.addr_range[1].start' 2>/dev/null))
  $(SN_CFG): $(FLOO_CFG)
 +	@command -v $(FLOO_GEN) >/dev/null || { echo "ERROR: $(FLOO_GEN) not on PATH (activate the floogen venv)"; exit 1; }
++	@for kv in 'nr_clusters:$(SN_CLUSTERS)' 'cluster_base_addr:$(SN_CL_BASE)' 'cluster_base_offset:$(SN_CL_OFFSET)' 'l2spm_addr:$(SN_L2_BASE)' 'l2spm_len:$(SN_L2_LEN)' 'dram_addr:$(SN_DRAM_BASE)' 'dram_len:$(SN_DRAM_LEN)'; do case "$${kv#*:}" in ''|0x0) echo "ERROR: floogen query '$${kv%%:*}' from $(FLOO_CFG) is empty/0x0 -- endpoint renamed or query failed"; exit 1;; esac; done
  	@sed -i 's/nr_clusters: .*/nr_clusters: $(SN_CLUSTERS),/' $@
 +	@sed -i 's/\(cluster_base_addr:[[:space:]]*\)0x[0-9a-fA-F]*/\1$(SN_CL_BASE)/' $@
 +	@sed -i 's/\(cluster_base_offset:[[:space:]]*\)0x[0-9a-fA-F]*/\1$(SN_CL_OFFSET)/' $@
@@ -787,7 +788,7 @@ index f791a51..49ce967 100644
  #define SNRT_CRT0_POST_BARRIER
  #define SNRT_CRT0_EXIT
 diff --git a/sw/sw.mk b/sw/sw.mk
-index f5ae51c..21481b2 100644
+index f5ae51c..d89820d 100644
 --- a/sw/sw.mk
 +++ b/sw/sw.mk
 @@ -41,6 +41,7 @@ SN_TESTS_INCDIRS  = $(SN_ROOT)/sw/kernels/blas
@@ -798,14 +799,7 @@ index f5ae51c..21481b2 100644
  SN_APPS += $(GW_SNITCH_SW_DIR)/apps/gemm
  SN_APPS += $(GW_SNITCH_SW_DIR)/apps/axpy
  SN_APPS += $(SN_ROOT)/sw/kernels/dnn/flashattention_2
-@@ -48,12 +49,18 @@ SN_APPS += $(GW_SNITCH_SW_DIR)/apps/fused_concat_linear
- SN_APPS += $(GW_SNITCH_SW_DIR)/apps/mha
- SN_APPS += $(GW_SNITCH_SW_DIR)/apps/summa_gemm
- SN_APPS += $(GW_SNITCH_SW_DIR)/apps/power_benchmarks
-+SN_APPS += $(GW_SNITCH_SW_DIR)/apps/qcs_replay
- 
- SN_TESTS = $(wildcard $(GW_SNITCH_SW_DIR)/tests/*.c)
- 
+@@ -54,6 +55,11 @@ SN_TESTS = $(wildcard $(GW_SNITCH_SW_DIR)/tests/*.c)
  $(GW_GEN_DIR)/gw_noc_cfg.h: $(UTIL_DIR)/mako_render.py $(FLOO_CFG)
  	 $< -t $(SN_RUNTIME_SRCDIR)/gw_noc_cfg.h.tpl -y $(FLOO_CFG) -o $@
  

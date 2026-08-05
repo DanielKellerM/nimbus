@@ -34,7 +34,7 @@ DISPATCH_FIXED = 0x40
 BINDING_BYTES = 0x10
 
 # f64 device kernels today; the parsed element type drives both the buffer size and the
-# seeded numpy dtype so an f32/f16 model can't overflow its page or halve its binding length.
+# seeded numpy dtype so an f32/f16 model gets the right byte count (not a half/double alloc).
 DTYPE = {'f64': ('<f8', 8), 'f32': ('<f4', 4), 'f16': ('<f2', 2)}
 
 
@@ -93,16 +93,29 @@ def main():
         text = fp.read()
     inputs, disp, outputs = parse_flow(text)
 
-    # Assign each distinct buffer (input / intermediate / output) its own L2 page.
+    # Give each distinct buffer (input / intermediate / output) its own page-aligned region
+    # sized to fit -- a buffer can exceed one 4 KiB page (64x64 f64 = 8 pages), so a fixed
+    # per-buffer page stride would let a large binding's seed stomp the next buffer.
     order = list(inputs)
     for _, _, res, _ in disp:
         if res not in order:
             order.append(res)
-    off = {ssa: DATA_OFF + i * PAGE for i, ssa in enumerate(order)}
     size = {ssa: b for ssa, (_, _, b) in inputs.items()}
     for _, _, res, b in disp:
         size[res] = b
-    end = max(off[s] + size[s] for s in order)
+    off = {}
+    cur = DATA_OFF
+    for ssa in order:
+        off[ssa] = cur
+        cur = (cur + size[ssa] + PAGE - 1) // PAGE * PAGE
+    end = cur
+    # Every dispatch operand must resolve to a laid-out buffer; a constant/global/dynamic-dim
+    # SSA would silently drop a binding, so fail loud (mirrors parse_flow's other guards).
+    for ordn, ops, _, _ in disp:
+        for s in ops:
+            if s not in off:
+                raise SystemExit(f'dispatch ord={ordn} operand {s} is neither a model input nor a '
+                                 f'prior dispatch result (constant/global/dynamic-dim?) -- unsupported')
 
     img = bytearray(((end - DESC_OFF + PAGE - 1) // PAGE) * PAGE)
 
