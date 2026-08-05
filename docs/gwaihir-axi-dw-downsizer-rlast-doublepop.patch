@@ -1,0 +1,41 @@
+Subject: [PATCH] axi_dw_downsizer: don't re-accept the terminal R beat (AR id-counter underflow)
+
+Under overlapping/back-to-back reads through the wide->narrow downsizer, the read
+FSM re-asserts the master-side R ready (mst_r_ready_tran[t]) in the cycle the
+already-forwarded *terminal* beat (r.last) is draining to the wide slave. Because
+the master valid/last is still held, the internal axi_demux id-counter is popped a
+SECOND time for a single AR -> pop(2 cycles) vs push(1 cycle) -> counter 0 -> 0x3f
+underflow (axi_demux_id_counters.sv cnt_underflow $fatal).
+
+Root cause: the accept gate (line ~568) permits a new master beat whenever the
+output slot is free OR being consumed, without excluding the last-beat drain. The
+slot only leaves the active state one cycle later on the wide handshake (line
+~638), leaving a window where the finished burst's held final beat is accepted
+(and counted) again.
+
+Fix: qualify the "output being consumed" branch of the accept gate with
+!r_req_q.r.last, so once the terminal beat has been forwarded the slot stops
+accepting (and stops popping) until it retires. r.last is 0 at a burst start
+(so a max-size burst whose burst_len legitimately == '1 is unaffected) and 1 only
+during the terminal-beat drain -- exactly the double-accept window. One
+r_ready pulse per beat => one demux pop per AR push.
+
+--- a/src/axi_dw_downsizer.sv
++++ b/src/axi_dw_downsizer.sv
+@@ -563,9 +563,13 @@
+           // Request was accepted
+           if (!r_req_q.ar_valid) begin
+             // Our turn
+             if ((idqueue_id == t) && idqueue_valid) begin
+-              // Ready to accept more data
+-              if (!slv_r_valid_tran[t] || (slv_r_valid_tran[t] && slv_r_ready_tran[t])) begin
++              // Ready to accept more data -- but NOT while the already-forwarded
++              // terminal beat (r.last) is draining to the wide slave: re-accepting
++              // there re-pops the demux AR id-counter for a finished burst and
++              // underflows it under overlapping reads. r.last is 0 at a burst
++              // start, so a legit max burst (burst_len=='1) is unaffected.
++              if (!slv_r_valid_tran[t] ||
++                  (slv_r_valid_tran[t] && slv_r_ready_tran[t] && !r_req_q.r.last)) begin
+                 mst_r_ready_tran[t] = 1'b1;
+
+                 if (mst_resp.r_valid) begin
