@@ -6,3 +6,6 @@ build/
 runs/
 # Machine-specific SoC tree symlink (per-machine; set locally)
 .gwaihir
+
+# Generated kernel-library staging (produce_kernel_lib.sh output)
+.gwaihir-kernel-lib/
