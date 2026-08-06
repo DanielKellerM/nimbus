@@ -9,3 +9,12 @@ runs/
 
 # Generated kernel-library staging (produce_kernel_lib.sh output)
 .gwaihir-kernel-lib/
+
+# Local-only docs (kept out of the remote by request)
+/docs/gwaihir-axi-dw-downsizer-rlast-bug.md
+/docs/nimbus-design.md
+/targets/gwaihir/GWAIHIR_PIN.md
+/targets/gwaihir/README.md
+/targets/gwaihir/RUNBOOK.md
+/targets/gwaihir/firmware/gwaihir/README.md
+/targets/gwaihir/patches/README.md
