@@ -143,8 +143,13 @@ void qcs_doorbell_ring(qcs_job_descriptor_t* job, uint32_t job_id) {
   //   scratch[1] = firmware entry point (L2 SPM base; same image for all clusters)
   //   scratch[0] = &return_code_array[i] (where this cluster's snrt_exit writes)
   for (uint32_t i = 0; i < QCS_CLUSTER_NUM; ++i) {
-    *CL_SCRATCH(i, 1) = (uint64_t)L2_SPM_BASE;                     // entry 0x70000000
-    *CL_SCRATCH(i, 0) = (uint64_t)(uintptr_t)&g_return_code_array[i][0];
+    // 32-bit half-writes (low then high): the tb's proven wake writes the 64-bit
+    // scratch as two 32-bit words; a single 64-bit CVA6 store to the cluster
+    // peripheral does not land the wake (clusters never start).
+    volatile uint32_t* s1 = (volatile uint32_t*)CL_SCRATCH(i, 1);
+    s1[0] = (uint32_t)(uintptr_t)L2_SPM_BASE; s1[1] = 0u;          // entry 0x70000000
+    volatile uint32_t* s0 = (volatile uint32_t*)CL_SCRATCH(i, 0);
+    s0[0] = (uint32_t)(uintptr_t)&g_return_code_array[i][0]; s0[1] = 0u;
     for (uint32_t j = 0; j < QCS_CLUSTER_NR_CORES; ++j) {
       g_return_code_array[i][j] = 0u;
     }
@@ -155,7 +160,7 @@ void qcs_doorbell_ring(qcs_job_descriptor_t* job, uint32_t job_id) {
   // core wakes (snrt_wake_up wakes the other 15 clusters), builds the kernel
   // table, and runs the QCS replay; the other clusters boot, pass the world
   // barrier, and return immediately (no QCS job -- see firmware main.c guard).
-  *CL_CLINT_SET(0) = (uint64_t)((1u << QCS_CLUSTER_NR_CORES) - 1u);
+  *(volatile uint32_t*)CL_CLINT_SET(0) = (uint32_t)((1u << QCS_CLUSTER_NR_CORES) - 1u);
 }
 
 uint32_t qcs_doorbell_wait(qcs_job_descriptor_t* job) {
