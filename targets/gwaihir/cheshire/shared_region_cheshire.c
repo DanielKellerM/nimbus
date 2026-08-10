@@ -145,12 +145,10 @@ void qcs_doorbell_ring(qcs_job_descriptor_t* job, uint32_t job_id) {
   //   scratch[1] = firmware entry point (L2 SPM base; same image for all clusters)
   //   scratch[0] = &return_code_array[i] (where this cluster's snrt_exit writes)
   for (uint32_t i = 0; i < QCS_CLUSTER_NUM; ++i) {
-    // Wake regs written as 32-bit halves. EMPIRICAL: the mesh wakes this way but not
-    // with a single 64-bit store; root cause NOT pinned and it is not a plain width
-    // mismatch -- the reg is logic[31:0] on a 64-bit reg bus (axi_to_reg DataWidth=64),
-    // so a 64-bit store should land the low word (simple_offload.c does 64-bit and
-    // works). Likely an ordering/AXI-path artifact; an AXI trace on the wake store would
-    // pin it. Do NOT revert to a 64-bit store without that trace: it hangs mode 3.
+    // Wake regs written 32-bit: a VPD trace of the working wake shows cl_clint_set
+    // is write-enabled only in the UPPER 32-bit lane of the 64-bit reg bus
+    // (reg2hw.cl_clint_set.wr_biten=0xffffffff<<32), so a single 64-bit store misses
+    // that lane. Do NOT widen these to 64-bit -- it hangs mode 3.
     volatile uint32_t* s1 = (volatile uint32_t*)CL_SCRATCH(i, 1);
     s1[0] = (uint32_t)(uintptr_t)L2_SPM_BASE; s1[1] = 0u;          // entry 0x70000000
     volatile uint32_t* s0 = (volatile uint32_t*)CL_SCRATCH(i, 0);
