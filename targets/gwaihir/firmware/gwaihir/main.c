@@ -185,22 +185,24 @@ int main() {
   }
   snrt_global_barrier();
 
-  // NO-JOB GUARD (principled): a host that wakes cluster 0 WITHOUT publishing a
-  // QCS descriptor (e.g. the proven simple_offload bring-up host, which only
-  // seeds the boot scratch regs) leaves the descriptor page zeroed -> magic 0,
-  // version 0, doorbell 0. With no valid job there is no work, so cluster 0
-  // behaves exactly like the other clusters and like simple.elf: return 0
-  // cleanly so crt0's snrt_exit reports per-core completion (rc 0) and the
-  // host's all-cores-done / sum-0 gate resolves. This runs AFTER snrt_init_libs'
-  // global (world) barrier (which already completed before main) and after the
-  // cluster-local table barrier, so neither barrier is perturbed. Every cluster-0
-  // core reads the SAME shared descriptor word and takes the SAME branch, so no
-  // core enters qcs_replay_stream and the cluster-hw-barrier pairing inside it
-  // can never diverge. A real job (doorbell != 0, valid magic/version) skips
-  // this and proceeds to replay as before.
-  if (job->magic != QCS_MAGIC || job->version != QCS_VERSION ||
-      job->doorbell == 0) {
+  // JOB GUARD (principled): a host that wakes cluster 0 WITHOUT publishing a QCS
+  // descriptor (e.g. the proven simple_offload bring-up host, which only seeds the
+  // boot scratch regs) leaves the descriptor page zeroed -> magic 0. That is a
+  // legitimate no-work wake: return 0 cleanly so crt0's snrt_exit reports per-core
+  // completion (rc 0) and the host's all-cores-done / sum-0 gate resolves. Runs
+  // AFTER snrt_init_libs' world barrier and the cluster-local table barrier, so
+  // neither is perturbed; every cluster-0 core reads the SAME descriptor word and
+  // takes the SAME branch, so no core enters qcs_replay_stream and the
+  // cluster-hw-barrier pairing can never diverge.
+  if (job->magic != QCS_MAGIC) {
     return 0;
+  }
+  // A descriptor IS present but malformed/unarmed (bad version or doorbell 0) is an
+  // ERROR, not a bring-up: return non-zero so a corrupt/empty job (e.g. a broken
+  // OFFLOAD_IMAGE) fails the headless return-code gate instead of green-washing it.
+  // Same uniform-branch property as above, so the barrier pairing still holds.
+  if (job->version != QCS_VERSION || job->doorbell == 0) {
+    return 1;
   }
 
   int rc = qcs_replay_stream(&region, job, &g_table);
