@@ -4,10 +4,9 @@
 //
 // Thin bridge from the spike-era IREE host glue (hostio.h talks to _write, IREE
 // pulls _sbrk for any stray malloc) to the Cheshire baremetal SW environment.
-// Cheshire provides _putchar (UART), printf, _start, _exit (crt0). We supply:
-//   * _write  -> loops over Cheshire _putchar so ALL of hostio.h's debug
-//                tracing comes out on the gwaihir UART console (no HTIF, which
-//                would wedge the console).
+// Cheshire provides printf, _start, _exit (crt0). We supply:
+//   * _write  -> bounded UART TX so ALL of hostio.h's debug tracing comes out on
+//                the gwaihir UART console without wedging on a stuck/X LSR.
 //   * _sbrk   -> bump allocator over a static heap window (Cheshire's spm.ld
 //                provides no heap/end symbol for newlib malloc).
 // pthread_mutex_* and iree_io_file_handle_* are still provided by the kept
@@ -23,16 +22,29 @@
 #include "params.h"
 #include "util.h"
 
-// Cheshire UART char output (libcheshire.a / sw/lib/dif/uart.c).
-extern void _putchar(char c);
-
-// Bring up the gwaihir/Cheshire UART so _putchar (and thus _write/hostio) emit
-// on the console. Mirrors sw/tests/helloworld.c. Must be called before any
-// printing.
+// Bring up the gwaihir/Cheshire UART so the console emits on _write/hostio.
+// Mirrors sw/tests/helloworld.c. Must be called before any printing.
 void cheshire_console_init(void) {
   uint32_t rtc_freq = CHS_REGS->rtc_freq.f.ref_freq;
   uint64_t reset_freq = clint_get_core_freq(rtc_freq, 2500);
   uart_init(&__uart_base_addr__, reset_freq, __BOOT_BAUDRATE);
+}
+
+// Upper bound on core cycles to wait for one UART char (overridable).
+#ifndef CONSOLE_TX_CYCLE_CAP
+#define CONSOLE_TX_CYCLE_CAP (1u << 22)
+#endif
+
+// Bounded TX (mirrors dif/uart.c __uart_write_ready): cap the THR-empty poll so a
+// stuck/X LSR -- e.g. an unclocked UART under 4-state VCS-debug -- can't wedge the
+// host; on a healthy UART the cap is never hit and output is byte-identical.
+static void console_putc(char c) {
+  void* uart = &__uart_base_addr__;
+  uint64_t t0 = get_mcycle();
+  while (!(*reg8(uart, UART_LINE_STATUS_REG_OFFSET) &
+           (1 << UART_LINE_STATUS_THR_EMPTY_BIT)))
+    if (get_mcycle() - t0 > CONSOLE_TX_CYCLE_CAP) return;  // wedged LSR: drop char
+  *reg8(uart, UART_THR_REG_OFFSET) = (uint8_t)c;
 }
 
 // Console bridge: hostio.h calls _write(1, ptr, len); route to the UART.
@@ -40,9 +52,8 @@ ssize_t _write(int file, const void* ptr, size_t len) {
   (void)file;
   const char* p = (const char*)ptr;
   for (size_t i = 0; i < len; ++i) {
-    char c = p[i];
-    if (c == '\n') _putchar('\r');  // CR+LF for terminals
-    _putchar(c);
+    if (p[i] == '\n') console_putc('\r');  // CR+LF for terminals
+    console_putc(p[i]);
   }
   return (ssize_t)len;
 }
