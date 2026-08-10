@@ -19,8 +19,9 @@
 //   offset (its main.c QCS_JOB_DESCRIPTOR_PA must equal QCS_JOB_DESCRIPTOR_OFFSET).
 //
 // Doorbell:  qcs_doorbell_ring writes the cluster boot scratch regs + rings
-//            cl_clint_set (msip) to wake the Snitch DM core, exactly as
-//            sw/cheshire/tests/simple_offload.c does. There is NO auto-complete.
+//            cl_clint_set (msip) to wake the Snitch DM core, following the boot
+//            model of sw/cheshire/tests/simple_offload.c (but writes the wake regs
+//            32-bit, see the note in qcs_doorbell_ring). There is NO auto-complete.
 // Wait:      qcs_doorbell_wait_completion polls the real completion word the DM
 //            core writes back into the L2-SPM job descriptor.
 
@@ -135,7 +136,8 @@ void qcs_doorbell_ring(qcs_job_descriptor_t* job, uint32_t job_id) {
   __atomic_store_n(&job->doorbell, job_id, __ATOMIC_RELEASE);
   __atomic_thread_fence(__ATOMIC_RELEASE);
 
-  // Cluster boot contract -- mirror sw/cheshire/tests/simple_offload.c EXACTLY:
+  // Cluster boot contract -- the boot model of sw/cheshire/tests/simple_offload.c
+  // (that file uses 64-bit stores; here the wake regs are written 32-bit, see below):
   // entry ALL SNRT_CLUSTER_NUM clusters' boot scratch regs, zero the per-core
   // return-code slots, THEN wake cluster 0 only. Cluster 0's snRuntime wakes the
   // rest (snrt_wake_up in crt0); all clusters reach the world barrier; on return
@@ -143,9 +145,10 @@ void qcs_doorbell_ring(qcs_job_descriptor_t* job, uint32_t job_id) {
   //   scratch[1] = firmware entry point (L2 SPM base; same image for all clusters)
   //   scratch[0] = &return_code_array[i] (where this cluster's snrt_exit writes)
   for (uint32_t i = 0; i < QCS_CLUSTER_NUM; ++i) {
-    // 32-bit half-writes (low then high): the tb's proven wake writes the 64-bit
-    // scratch as two 32-bit words; a single 64-bit CVA6 store to the cluster
-    // peripheral does not land the wake (clusters never start).
+    // Wake regs written as 32-bit halves. EMPIRICAL: the mesh wakes this way but not
+    // with a single 64-bit store; root cause not pinned (simple_offload.c uses 64-bit
+    // and works, so likely an ordering artifact -- an AXI trace on the wake store would
+    // settle it). Do NOT revert to a 64-bit store without that trace: it hangs mode 3.
     volatile uint32_t* s1 = (volatile uint32_t*)CL_SCRATCH(i, 1);
     s1[0] = (uint32_t)(uintptr_t)L2_SPM_BASE; s1[1] = 0u;          // entry 0x70000000
     volatile uint32_t* s0 = (volatile uint32_t*)CL_SCRATCH(i, 0);
