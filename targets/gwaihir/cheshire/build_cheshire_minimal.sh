@@ -9,7 +9,7 @@ usage() {
   cat >&2 <<EOF
 usage: GW=<gwaihir build tree> [RV=<bin>] [BUILD_DIR=<dir>] [HOST_LD=<ld>] ${0##*/}
   GW         gwaihir build tree with .bender (cheshire checkout) + .generated (addrmap)   [required]
-  RV         riscv64 gcc bin dir   [default: \$CHS_SW_GCC_BINROOT, else gcc-12.2.0 to match libcheshire's LTO]
+  RV         riscv64 gcc bin dir   [default: \$CHS_SW_GCC_BINROOT, else riscv64-unknown-elf-gcc on PATH; use gcc-12.2.0 to match libcheshire's LTO]
   BUILD_DIR  .o/.elf output dir     [default: <script dir>/build]
   HOST_LD    link script           [default: the hybrid.ld generated from the addrmap]
 EOF
@@ -19,12 +19,12 @@ EOF
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this repo's cheshire host sources
 TARGET_DIR="$(dirname "$HERE")"                         # targets/gwaihir (transport/ lives here)
 
-RV="${RV:-${CHS_SW_GCC_BINROOT:-/usr/pack/riscv-1.0-kgf/riscv64-gcc-12.2.0/bin}}"
+RV="${RV:-${CHS_SW_GCC_BINROOT:-$(command -v riscv64-unknown-elf-gcc 2>/dev/null | sed 's,/[^/]*$,,')}}"
 PFX="$RV/riscv64-unknown-elf-"
 GCC="${PFX}gcc"
 [ -x "$GCC" ] || { echo "no riscv gcc at '$GCC' -- set RV" >&2; exit 1; }
 
-: "${GW:?set GW to the gwaihir build tree (has .bender + .generated)}" || usage
+[ -n "${GW:-}" ] || usage
 CHS=$(ls -d "$GW"/.bender/git/checkouts/cheshire-*/ 2>/dev/null | head -1)
 GW_GEN="$GW/.generated"
 [ -n "$CHS" ] && [ -d "${CHS}sw" ] && [ -d "$GW_GEN" ] \
@@ -65,3 +65,24 @@ echo "== result =="
 ${PFX}size "$OUT"
 ${PFX}readelf -hS "$OUT" | grep -E "Entry|\.text|\.bss|\.misc|Name"
 echo "ELF: $OUT"
+
+# L2-SPM layout guard: host + QCS/firmware share one aperture carved by hand; assert the
+# host L2 footprint stays clear of the device zone + return-code page (the l2spm-overlap
+# class). Aperture derived from the same addrmap as hybrid.ld. Set GW_FW_ELF=<qcs_replay.elf>
+# to also cross-check the firmware image. chimera-sdk check_section_overlaps.py analog.
+if [ "$HOST_LD" = "$BUILD_DIR/hybrid.ld" ]; then
+  echo "== L2-SPM layout guard =="
+  _l2() { printf '#include "gw_raw_addrmap.h"\n%s\n' "$1" | $GCC -E -P -x c "-I$GW_GEN" - | tail -1; }
+  L2BASE=$(( $(_l2 'GW_L2_SPM_BASE_ADDR(0)') )); L2SIZE=$(( $(_l2 'GW_L2_SPM_TOTAL_SIZE') ))
+  # Host window = the l2data region hybrid.ld actually used (itself addrmap-derived); reserve
+  # the rest of the aperture so any host section outside l2data trips the guard -- the layout
+  # offsets are read from the linker script, not re-typed here.
+  _ld=$(tr '\n' ' ' < "$HOST_LD")
+  L2O=$(( $(sed -n 's/.*l2data[^:]*:[[:space:]]*ORIGIN[[:space:]]*=[[:space:]]*\([^,]*\),.*/\1/p' <<<"$_ld") ))
+  L2END=$(( L2O + $(sed -n 's/.*l2data[^:]*:.*LENGTH[[:space:]]*=[[:space:]]*\([^}]*\)}.*/\1/p' <<<"$_ld") ))
+  python3 "$HERE/check_l2_overlap.py" "$OUT" ${GW_FW_ELF:+"$GW_FW_ELF"} \
+    --readelf "${PFX}readelf" --aperture "$L2BASE:$L2SIZE" \
+    --reserve "$L2BASE:$((L2O-L2BASE)):qcs-device-zone" \
+    --reserve "$L2END:$((L2BASE+L2SIZE-L2END)):host-reserved-top" \
+    || { echo "!! L2-SPM layout guard FAILED (see overlap above)"; exit 1; }
+fi

@@ -13,6 +13,7 @@ runs/
 # Local-only docs (kept out of the remote by request)
 /docs/gwaihir-axi-dw-downsizer-rlast-bug.md
 /docs/nimbus-design.md
+/docs/cluster-cls-init-and-multibinary.md
 /targets/gwaihir/GWAIHIR_PIN.md
 /targets/gwaihir/README.md
 /targets/gwaihir/RUNBOOK.md
