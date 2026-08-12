@@ -13,6 +13,4 @@ runs/
 # Local-only docs -- working notes, kept out of the remote by request.
 /docs/
 /targets/gwaihir/GWAIHIR_PIN.md
-/targets/gwaihir/README.md
-/targets/gwaihir/firmware/gwaihir/README.md
 /targets/gwaihir/patches/README.md
